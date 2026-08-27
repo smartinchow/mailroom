@@ -1,13 +1,9 @@
 node_modules/
 dist/
-build/
 .next/
-coverage/
-
 .env
 .env.*
 !.env.example
-
-*.log
+*.tsbuildinfo
+coverage/
 .DS_Store
-.scratch/

@@ -1,0 +1,192 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BodyRetention {
+  NONE
+  REDACTED
+  FULL
+}
+
+enum CarrierType {
+  ACS
+  SES
+  SMTP
+}
+
+enum MessageStatus {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  BOUNCED
+  SUPPRESSED
+  SPAM
+  COMPLAINED
+  FAILED
+}
+
+enum EventType {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  BOUNCED
+  SUPPRESSED
+  COMPLAINED
+  SPAM
+  DELAYED
+  FAILED
+  OPENED
+  CLICKED
+}
+
+enum SuppressionReason {
+  HARD_BOUNCE
+  COMPLAINT
+  MANUAL
+}
+
+model Project {
+  id                 String        @id @default(cuid())
+  name               String
+  slug               String        @unique
+  bodyRetention      BodyRetention @default(REDACTED)
+  bodyRetentionDays  Int           @default(90)
+  hourlyCap          Int?
+  createdAt          DateTime      @default(now())
+
+  apiKeys  ApiKey[]
+  domains  Domain[]
+  messages Message[]
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  projectId  String
+  name       String
+  prefix     String    @unique
+  keyHash    String
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+}
+
+model Carrier {
+  id            String      @id @default(cuid())
+  type          CarrierType
+  name          String      @unique
+  configEnc     String
+  enabled       Boolean     @default(true)
+  ratePerSecond Int         @default(1)
+  ratePerHour   Int         @default(100)
+  createdAt     DateTime    @default(now())
+
+  domains         Domain[]  @relation("primary")
+  fallbackDomains Domain[]  @relation("fallback")
+  messages        Message[]
+}
+
+model Domain {
+  id                String    @id @default(cuid())
+  name              String    @unique
+  projectId         String?
+  carrierId         String
+  fallbackCarrierId String?
+  verifiedAt        DateTime?
+  notes             String?
+
+  project         Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  carrier         Carrier  @relation("primary", fields: [carrierId], references: [id])
+  fallbackCarrier Carrier? @relation("fallback", fields: [fallbackCarrierId], references: [id])
+
+  messages Message[]
+}
+
+model Message {
+  id                String        @id
+  projectId         String
+  domainId          String
+  carrierId         String
+  idempotencyKey    String?
+  from              String
+  to                String[]
+  cc                String[]
+  bcc               String[]
+  replyTo           String?
+  subject           String
+  bodyHtml          String?
+  bodyText          String?
+  headers           Json          @default("{}")
+  tags              Json          @default("{}")
+  status            MessageStatus @default(QUEUED)
+  providerMessageId String?
+  attempts          Int           @default(0)
+  lastError         String?
+  queuedAt          DateTime      @default(now())
+  sentAt            DateTime?
+  lastEventAt       DateTime?
+  redactedLinkCount Int           @default(0)
+  bodyPurgedAt      DateTime?
+
+  project     Project       @relation(fields: [projectId], references: [id])
+  domain      Domain        @relation(fields: [domainId], references: [id])
+  carrier     Carrier       @relation(fields: [carrierId], references: [id])
+  events      MessageEvent[]
+  attachments Attachment[]
+
+  @@unique([projectId, idempotencyKey])
+  @@index([projectId, queuedAt(sort: Desc)])
+  @@index([providerMessageId])
+  @@index([status, queuedAt])
+}
+
+model MessageEvent {
+  id          String    @id @default(cuid())
+  messageId   String
+  type        EventType
+  recipient   String?
+  occurredAt  DateTime
+  providerRaw Json
+  receivedAt  DateTime  @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, type, occurredAt])
+  @@index([messageId])
+}
+
+model Suppression {
+  id        String            @id @default(cuid())
+  address   String
+  scope     String            @default("GLOBAL")
+  reason    SuppressionReason
+  messageId String?
+  createdAt DateTime          @default(now())
+  expiresAt DateTime?
+
+  @@unique([address, scope])
+  @@index([address])
+}
+
+model Attachment {
+  id          String @id @default(cuid())
+  messageId   String
+  filename    String
+  contentType String
+  bytes       Int
+  sha256      String
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+}

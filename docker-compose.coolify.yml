@@ -1,0 +1,73 @@
+# Coolify deployment variant. Differences from docker-compose.yml:
+# no host port mappings (Coolify's traefik routes by SERVICE_FQDN), and
+# Coolify magic envs generate/route the public domains per service.
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mailroom
+      POSTGRES_USER: mailroom
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mailroom -d mailroom"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_FQDN_API_3000: ""
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://mailroom:${POSTGRES_PASSWORD}@postgres:5432/mailroom
+      REDIS_URL: redis://redis:6379
+      MAILROOM_ENCRYPTION_KEY: ${MAILROOM_ENCRYPTION_KEY:?set MAILROOM_ENCRYPTION_KEY}
+      MAILROOM_ENCRYPTION_KEYS_OLD: ${MAILROOM_ENCRYPTION_KEYS_OLD:-}
+      PUBLIC_URL: ${PUBLIC_URL:?set PUBLIC_URL}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:?set ADMIN_API_TOKEN}
+      HOOK_SECRET: ${HOOK_SECRET:?set HOOK_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      SERVICE_FQDN_WEB_3000: ""
+      NODE_ENV: production
+      API_URL: http://api:3000
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN}
+      WEB_SESSION_SECRET: ${WEB_SESSION_SECRET:?set WEB_SESSION_SECRET}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+
+volumes:
+  pgdata:
+  redisdata:

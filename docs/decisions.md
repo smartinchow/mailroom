@@ -120,3 +120,33 @@ SES SMTP); SNS is only one of several event destinations for delivery notificati
 `SendEmailCommand` with a configuration set whose event destination is an SNS topic
 delivering to `/v1/hooks/ses/:secret` — with signature verification, since an unverified
 SNS endpoint accepts forged notifications from anyone.
+
+## D-10 — Licence: AGPL-3.0
+
+**Decided: AGPL-3.0-only** (2026-08-27, implementation start). Matches the peer set,
+discourages a hosted rip; internal use unaffected. LICENSE committed before first push.
+
+## D-11 — v1 admin auth: env password + shared admin token
+
+**Decided.** Dashboard login is a single operator password (`ADMIN_PASSWORD` env) with a
+signed HttpOnly session cookie; the web app calls the API's `/v1/admin/*` with a shared
+`ADMIN_API_TOKEN` that never reaches the browser. TOTP and OIDC (design §10) deferred to a
+later milestone — v1 is a single operator behind TLS. Rejected for v1: full user table
+(overkill), GitHub-OAuth-only (the useSend complaint).
+
+## D-12 — Verbatim send body lives in a Redis stash, not the database
+
+**Decided.** The database only ever holds the policy-filtered body (D-06). The carrier
+must still send the original, so the API stashes the verbatim body + attachments in Redis
+(`sendbody:<id>`, TTL 7 days) and the worker deletes it after a successful send or final
+failure. If the stash is lost (Redis flush) the worker falls back to the stored, possibly
+redacted, body rather than dropping the send.
+
+## D-13 — ACS send waits for the LRO to complete
+
+**Decided.** `@azure/communication-email` only exposes the operation id (== Event Grid
+`data.messageId`) once the long-running operation reaches a terminal state, so the worker
+calls `pollUntilDone()`. Blocking a worker slot for seconds is irrelevant at ACS quota
+scale (~100/hour), and it gives a definitive send success/failure per attempt. Rejected:
+reading the undocumented `operationLocation` from poller internals (breaks across SDK
+versions).

@@ -1,4 +1,5 @@
 import { EmailClient } from "@azure/communication-email";
+import { bareAddress } from "../address.js";
 import { safeEqual } from "../crypto.js";
 import type {
   AcsConfig,
@@ -37,8 +38,12 @@ export function createAcsCarrier(config: AcsConfig): Carrier {
     type: "acs",
 
     async send(msg: OutboundMessage) {
+      // ACS senderAddress must be a bare address; the display name comes from
+      // the sender-username configuration on the ACS domain, not the payload.
+      const sender = bareAddress(msg.from);
+      if (!sender) throw new Error(`unparseable from address: ${msg.from}`);
       const poller = await client.beginSend({
-        senderAddress: msg.from,
+        senderAddress: sender,
         recipients: {
           to: msg.to.map((address) => ({ address })),
           cc: msg.cc.map((address) => ({ address })),

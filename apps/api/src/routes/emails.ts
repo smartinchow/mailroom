@@ -10,6 +10,7 @@ import { applyBodyPolicy } from "../redactor.js";
 import { isSuppressed } from "../suppression.js";
 import { enqueueSend } from "../queue.js";
 import { logger } from "../logger.js";
+import { bareAddress } from "../address.js";
 
 const address = z.string().min(3).max(320);
 const addressList = z.union([address, z.array(address).min(1).max(50)]).transform((v) => (Array.isArray(v) ? v : [v]));
@@ -38,13 +39,6 @@ const sendSchema = z.object({
 });
 
 type SendInput = z.infer<typeof sendSchema>;
-
-/** Extract the bare address from "Display Name <a@b.c>" or "a@b.c". */
-export function bareAddress(from: string): string | null {
-  const angled = from.match(/<([^<>]+)>\s*$/);
-  const addr = (angled ? angled[1] : from).trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(addr) ? addr.toLowerCase() : null;
-}
 
 type SendOutcome =
   | { code: 202; body: { id: string; status: string } }

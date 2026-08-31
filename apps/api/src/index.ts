@@ -3,6 +3,7 @@ import { env } from "./env.js";
 import { logger } from "./logger.js";
 import { prisma } from "./db.js";
 import { registerEmailRoutes } from "./routes/emails.js";
+import { registerMessengerRoutes } from "./routes/messengers.js";
 import { registerHookRoutes } from "./routes/hooks.js";
 import { registerSuppressionRoutes } from "./routes/suppressions.js";
 import { registerAdminRoutes } from "./routes/admin.js";
@@ -21,6 +22,7 @@ async function main(): Promise<void> {
 
   registerHealthRoutes(app);
   registerEmailRoutes(app);
+  registerMessengerRoutes(app);
   registerHookRoutes(app);
   registerSuppressionRoutes(app);
   registerAdminRoutes(app);

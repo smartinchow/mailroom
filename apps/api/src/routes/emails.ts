@@ -38,14 +38,14 @@ const sendSchema = z.object({
     .default([]),
 });
 
-type SendInput = z.infer<typeof sendSchema>;
+export type SendInput = z.infer<typeof sendSchema>;
 
-type SendOutcome =
+export type SendOutcome =
   | { code: 202; body: { id: string; status: string } }
   | { code: 200; body: { id: string; status: string } }
   | { code: 400 | 403 | 409 | 422; body: { error: string; [k: string]: unknown } };
 
-async function handleSend(project: Project, input: SendInput, idempotencyKey?: string): Promise<SendOutcome> {
+export async function handleSend(project: Project, input: SendInput, idempotencyKey?: string): Promise<SendOutcome> {
   if (!input.html && !input.text) {
     return { code: 422, body: { error: "html_or_text_required" } };
   }

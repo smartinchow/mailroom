@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../db.js";
@@ -6,7 +6,15 @@ import { env } from "../env.js";
 import { encrypt, generateApiKey } from "../crypto.js";
 import { requireAdminToken } from "../auth.js";
 import { addSuppression } from "../suppression.js";
-import { invalidateCarrierCache } from "../carriers/index.js";
+import { carrierFor, invalidateCarrierCache } from "../carriers/index.js";
+import {
+  DomainError,
+  checkDomain,
+  createDomain as createDomainRecord,
+  deleteDomain as deleteDomainRecord,
+  toPublicDomain,
+  type DomainWithCarrier,
+} from "../domains.js";
 import { sendQueue } from "../queue.js";
 
 const carrierConfigSchema = z.discriminatedUnion("type", [
@@ -27,6 +35,32 @@ const carrierConfigSchema = z.discriminatedUnion("type", [
     pass: z.string().optional(),
   }),
 ]);
+
+/**
+ * Admin rows are the public §3 object plus the operator-only fields. The
+ * dashboard reads exactly this shape.
+ */
+type AdminDomainRow = DomainWithCarrier & { project?: { slug: string } | null };
+
+function toAdminDomain(d: AdminDomainRow) {
+  return {
+    ...toPublicDomain(d),
+    projectSlug: d.project?.slug ?? null,
+    carrierId: d.carrierId,
+    fallbackCarrierId: d.fallbackCarrierId,
+    notes: d.notes,
+  };
+}
+
+function sendAdminDomainError(reply: FastifyReply, err: unknown): FastifyReply {
+  if (err instanceof DomainError) return reply.code(err.status).send({ error: err.code, ...err.extra });
+  throw err;
+}
+
+const adminDomainInclude = {
+  carrier: { select: { id: true, name: true, type: true } },
+  project: { select: { slug: true } },
+};
 
 export function registerAdminRoutes(app: FastifyInstance): void {
   app.addHook("onRequest", async (req, reply) => {
@@ -275,6 +309,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         name: c.name,
         type: c.type,
         enabled: c.enabled,
+        isDefault: c.isDefault,
         ratePerSecond: c.ratePerSecond,
         ratePerHour: c.ratePerHour,
         createdAt: c.createdAt,
@@ -289,7 +324,16 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     ratePerSecond: z.number().int().min(1).default(1),
     ratePerHour: z.number().int().min(1).default(100),
     enabled: z.boolean().default(true),
+    isDefault: z.boolean().default(false),
   });
+
+  /** Exactly one carrier is default; clearing the others is part of the same transaction. */
+  async function setDefaultCarrier(id: string): Promise<void> {
+    await prisma.$transaction([
+      prisma.carrier.updateMany({ where: { id: { not: id } }, data: { isDefault: false } }),
+      prisma.carrier.update({ where: { id }, data: { isDefault: true } }),
+    ]);
+  }
 
   app.post("/v1/admin/carriers", async (req, reply) => {
     const parsed = carrierCreateSchema.safeParse(req.body);
@@ -307,7 +351,13 @@ export function registerAdminRoutes(app: FastifyInstance): void {
         enabled: parsed.data.enabled,
       },
     });
-    return reply.code(201).send({ id: carrier.id, name: carrier.name, type: carrier.type });
+    if (parsed.data.isDefault) await setDefaultCarrier(carrier.id);
+    return reply.code(201).send({
+      id: carrier.id,
+      name: carrier.name,
+      type: carrier.type,
+      isDefault: parsed.data.isDefault,
+    });
   });
 
   app.patch("/v1/admin/carriers/:id", async (req, reply) => {
@@ -318,16 +368,52 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       ratePerSecond: z.number().int().min(1).optional(),
       ratePerHour: z.number().int().min(1).optional(),
       enabled: z.boolean().optional(),
+      isDefault: z.boolean().optional(),
     });
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
-    const { config, ...rest } = parsed.data;
-    const carrier = await prisma.carrier.update({
+    const { config, isDefault, ...rest } = parsed.data;
+    let carrier = await prisma.carrier.update({
       where: { id },
-      data: { ...rest, ...(config ? { configEnc: encrypt(JSON.stringify(config)) } : {}) },
+      data: {
+        ...rest,
+        ...(isDefault === false ? { isDefault: false } : {}),
+        ...(config ? { configEnc: encrypt(JSON.stringify(config)) } : {}),
+      },
     });
+    // true promotes this carrier and demotes every other one; false only clears.
+    if (isDefault === true) {
+      await setDefaultCarrier(id);
+      carrier = { ...carrier, isDefault: true };
+    }
     invalidateCarrierCache(id);
-    return reply.send({ id: carrier.id, name: carrier.name, enabled: carrier.enabled });
+    return reply.send({
+      id: carrier.id,
+      name: carrier.name,
+      enabled: carrier.enabled,
+      isDefault: carrier.isDefault,
+    });
+  });
+
+  /**
+   * SES account sending limits — invaluable while the account is still in the
+   * sandbox. Carriers that cannot report limits 404 (the capability check lives
+   * on the adapter, so there is no provider branch here).
+   */
+  app.get("/v1/admin/carriers/:id/quota", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const row = await prisma.carrier.findUnique({ where: { id } });
+    if (!row) return reply.code(404).send({ error: "not_found" });
+    const carrier = carrierFor(row);
+    if (!carrier.accountQuota) return reply.code(404).send({ error: "quota_not_supported" });
+    try {
+      return reply.send(await carrier.accountQuota());
+    } catch (err) {
+      return reply.code(502).send({
+        error: "provider_error",
+        message: (err instanceof Error ? err.message : String(err)).slice(0, 500),
+      });
+    }
   });
 
   // ---- Domains ----
@@ -335,50 +421,79 @@ export function registerAdminRoutes(app: FastifyInstance): void {
   app.get("/v1/admin/domains", async (_req, reply) => {
     const domains = await prisma.domain.findMany({
       orderBy: { name: "asc" },
-      include: { project: { select: { slug: true } }, carrier: { select: { name: true } } },
+      include: adminDomainInclude,
     });
-    return reply.send(
-      domains.map((d) => ({
-        id: d.id,
-        name: d.name,
-        projectId: d.projectId,
-        projectSlug: d.project?.slug ?? null,
-        carrierId: d.carrierId,
-        carrierName: d.carrier.name,
-        fallbackCarrierId: d.fallbackCarrierId,
-        verifiedAt: d.verifiedAt,
-        notes: d.notes,
-      })),
-    );
+    return reply.send(domains.map(toAdminDomain));
   });
 
   const domainSchema = z.object({
-    name: z.string().regex(/^[a-z0-9.-]+\.[a-z]{2,}$/),
+    name: z.string().min(3).max(253),
     projectId: z.string().nullable().optional(),
-    carrierId: z.string(),
+    carrierId: z.string().nullable().optional(),
     fallbackCarrierId: z.string().nullable().optional(),
     notes: z.string().max(1000).nullable().optional(),
+  });
+
+  app.get("/v1/admin/domains/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const domain = await prisma.domain.findUnique({ where: { id }, include: adminDomainInclude });
+    if (!domain) return reply.code(404).send({ error: "not_found" });
+    return reply.send(toAdminDomain(domain));
   });
 
   app.post("/v1/admin/domains", async (req, reply) => {
     const parsed = domainSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request", details: parsed.error.flatten() });
-    const domain = await prisma.domain.create({ data: { ...parsed.data, name: parsed.data.name.toLowerCase() } });
-    return reply.code(201).send(domain);
+    try {
+      // Same service as the public route: provisions on the carrier when it
+      // supports it, falls back to a manual (already VERIFIED) domain.
+      const domain = await createDomainRecord(parsed.data);
+      const full = await prisma.domain.findUniqueOrThrow({
+        where: { id: domain.id },
+        include: adminDomainInclude,
+      });
+      return reply.code(201).send(toAdminDomain(full));
+    } catch (err) {
+      return sendAdminDomainError(reply, err);
+    }
   });
 
   app.patch("/v1/admin/domains/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
-    const parsed = domainSchema.partial().safeParse(req.body);
+    const parsed = domainSchema.partial().omit({ name: true }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
-    const domain = await prisma.domain.update({ where: { id }, data: parsed.data });
-    return reply.send(domain);
+    const { carrierId, ...rest } = parsed.data;
+    const domain = await prisma.domain.update({
+      where: { id },
+      data: { ...rest, ...(carrierId ? { carrierId } : {}) },
+      include: adminDomainInclude,
+    });
+    return reply.send(toAdminDomain(domain));
+  });
+
+  app.post("/v1/admin/domains/:id/verify", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    try {
+      const domain = await checkDomain(id);
+      const full = await prisma.domain.findUniqueOrThrow({
+        where: { id: domain.id },
+        include: adminDomainInclude,
+      });
+      return reply.send(toAdminDomain(full));
+    } catch (err) {
+      return sendAdminDomainError(reply, err);
+    }
   });
 
   app.delete("/v1/admin/domains/:id", async (req, reply) => {
     const { id } = req.params as { id: string };
-    await prisma.domain.delete({ where: { id } });
-    return reply.send({ ok: true });
+    try {
+      // Also removes the provider identity; 409 when the message log needs it.
+      await deleteDomainRecord(id);
+      return reply.send({ ok: true });
+    } catch (err) {
+      return sendAdminDomainError(reply, err);
+    }
   });
 
   app.get("/v1/admin/hook-urls", async (_req, reply) => {

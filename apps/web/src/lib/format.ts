@@ -1,4 +1,4 @@
-import type { MessageStatus } from "./types";
+import type { DnsRecordStatus, DomainStatus, MessageStatus } from "./types";
 
 export function formatDate(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -24,6 +24,21 @@ export const STATUS_CHIP_CLASSES: Record<MessageStatus, string> = {
   SPAM: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200",
   COMPLAINED: "bg-rose-100 text-rose-800 dark:bg-rose-900 dark:text-rose-200",
   FAILED: "bg-red-200 text-red-900 dark:bg-red-950 dark:text-red-200",
+};
+
+/** verified = green, pending/temporary_failure = amber, failed = red (spec §9). */
+export const DOMAIN_STATUS_CHIP_CLASSES: Record<DomainStatus, string> = {
+  verified: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200",
+  pending: "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200",
+  temporary_failure: "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200",
+  failed: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
+};
+
+export const DNS_RECORD_STATUS_CHIP_CLASSES: Record<DnsRecordStatus, string> = {
+  verified: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200",
+  pending: "bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200",
+  not_started: "bg-zinc-200 text-zinc-800 dark:bg-zinc-700 dark:text-zinc-200",
+  failed: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
 };
 
 export const ALL_STATUSES: MessageStatus[] = [

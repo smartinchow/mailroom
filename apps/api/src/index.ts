@@ -4,6 +4,7 @@ import { logger } from "./logger.js";
 import { prisma } from "./db.js";
 import { registerEmailRoutes } from "./routes/emails.js";
 import { registerMessengerRoutes } from "./routes/messengers.js";
+import { registerDomainRoutes } from "./routes/domains.js";
 import { registerHookRoutes } from "./routes/hooks.js";
 import { registerSuppressionRoutes } from "./routes/suppressions.js";
 import { registerAdminRoutes } from "./routes/admin.js";
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
   registerHealthRoutes(app);
   registerEmailRoutes(app);
   registerMessengerRoutes(app);
+  registerDomainRoutes(app);
   registerHookRoutes(app);
   registerSuppressionRoutes(app);
   registerAdminRoutes(app);

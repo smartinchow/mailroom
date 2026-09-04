@@ -59,6 +59,14 @@ export async function handleSend(project: Project, input: SendInput, idempotency
   if (!domain || (domain.projectId != null && domain.projectId !== project.id)) {
     return { code: 403, body: { error: "domain_not_allowed", domain: fromDomain } };
   }
+  // Records exist but DNS was never published, or the provider rejected it:
+  // sending would be a guaranteed bounce or an unsigned message.
+  if (domain.status !== "VERIFIED") {
+    return {
+      code: 403,
+      body: { error: "domain_not_verified", domain: fromDomain, status: domain.status.toLowerCase() },
+    };
+  }
   if (!domain.carrier.enabled) {
     return { code: 422, body: { error: "carrier_disabled", carrier: domain.carrier.name } };
   }

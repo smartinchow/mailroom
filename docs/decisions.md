@@ -130,7 +130,7 @@ discourages a hosted rip; internal use unaffected. LICENSE committed before firs
 
 **Decided.** Dashboard login is a single operator password (`ADMIN_PASSWORD` env) with a
 signed HttpOnly session cookie; the web app calls the API's `/v1/admin/*` with a shared
-`ADMIN_API_TOKEN` that never reaches the browser. TOTP and OIDC (design §10) deferred to a
+`ADMIN_API_TOKEN` that never reaches the browser. TOTP and OIDC (design §11) deferred to a
 later milestone — v1 is a single operator behind TLS. Rejected for v1: full user table
 (overkill), GitHub-OAuth-only (the useSend complaint).
 
@@ -150,3 +150,21 @@ calls `pollUntilDone()`. Blocking a worker slot for seconds is irrelevant at ACS
 scale (~100/hour), and it gives a definitive send success/failure per attempt. Rejected:
 reading the undocumented `operationLocation` from poller internals (breaks across SDK
 versions).
+
+## D-14 — Platform SES carrier is the default; Mailroom provisions and verifies sending domains through the carrier
+
+**Decided.** Mailroom adds domains the way resend.com does: a project calls `POST
+/v1/domains` with just a name, gets back the DNS records to publish, and Mailroom polls the
+carrier every 5 minutes until it reports verified. One platform-level Amazon SES carrier
+(account 541165757072, `ap-southeast-2`, configuration set `mailroom`) is marked the
+default carrier that new domains provision against; ACS and SMTP domains stay "manual" —
+verified at creation, no records, no polling — so existing production senders (tx.amlify.au,
+tintinpos.com, maro.com.au) are unaffected. Rejected: a per-project AWS account per
+customer (the isolation is nice but the operational cost — one more AWS account, one more
+IAM user, one more SES identity to sandbox-graduate, per project — is exactly the tax
+Mailroom exists to remove); Mailroom generating and publishing DNS records itself via a
+registrar API (D-03 already rules out Mailroom taking on delivery infrastructure, and this
+would add credential scope for every registrar a customer happens to use, for a feature
+Cloudflare/Route53/etc. already do safely). DKIM signing and SPF alignment remain entirely
+the carrier's job (D-03 intact) — Mailroom only relays the tokens SES issues and checks
+whether they resolved.

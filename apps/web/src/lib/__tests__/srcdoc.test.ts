@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildBodySrcdoc } from "../srcdoc";
 
-describe("buildBodySrcdoc (security-critical rendering, design §9.4)", () => {
+describe("buildBodySrcdoc (security-critical rendering, design §10.4)", () => {
   it("injects a CSP meta with default-src 'none'", () => {
     const doc = buildBodySrcdoc("<p>hi</p>", false);
     expect(doc).toContain('http-equiv="Content-Security-Policy"');

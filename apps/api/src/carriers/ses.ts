@@ -1,19 +1,29 @@
 import {
+  AlreadyExistsException,
+  CreateEmailIdentityCommand,
+  DeleteEmailIdentityCommand,
+  GetAccountCommand,
+  GetEmailIdentityCommand,
+  NotFoundException,
+  PutEmailIdentityMailFromAttributesCommand,
   SESv2Client,
   SendEmailCommand,
   type SendEmailCommandInput,
 } from "@aws-sdk/client-sesv2";
+import { resolveTxt as dnsResolveTxt } from "node:dns/promises";
 import * as sesv2 from "@aws-sdk/client-sesv2";
 import { X509Certificate, verify as cryptoVerify } from "node:crypto";
 import type {
   Carrier,
+  DnsRecord,
+  DomainProvisioner,
   HookVerdict,
   NormalizedEvent,
   OutboundMessage,
   RawRequest,
   SesConfig,
 } from "./types.js";
-import type { EventType } from "@prisma/client";
+import type { DomainStatus, EventType } from "@prisma/client";
 
 /**
  * SES carrier. Facts that are easy to get wrong (see CLAUDE.md / D-09):
@@ -279,20 +289,239 @@ function normalizeSesEvent(event: any, out: NormalizedEvent[]): void {
 }
 
 // ---------------------------------------------------------------------------
+// Domain provisioning (Easy DKIM + custom MAIL FROM).
+// ---------------------------------------------------------------------------
+
+/** SES DkimStatus / MailFromDomainStatus, both use this vocabulary. */
+type SesVerifyStatus = "SUCCESS" | "FAILED" | "TEMPORARY_FAILURE" | "PENDING" | "NOT_STARTED";
+
+/** Per-record status. TEMPORARY_FAILURE is a provider-side retry, not a record fault. */
+function recordStatus(status: SesVerifyStatus | undefined): DnsRecord["status"] {
+  switch (status) {
+    case "SUCCESS":
+      return "VERIFIED";
+    case "FAILED":
+      return "FAILED";
+    default:
+      // TEMPORARY_FAILURE, PENDING, NOT_STARTED and "no answer yet".
+      return "PENDING";
+  }
+}
+
+/**
+ * The six records a Resend-style SES identity needs: three Easy DKIM CNAMEs,
+ * the MAIL FROM MX + SPF pair (so SPF aligns with the From domain), and a
+ * recommended DMARC policy SES itself never checks.
+ */
+function buildRecords(params: {
+  name: string;
+  mailFromDomain: string;
+  region: string;
+  tokens: string[];
+  dkimStatus?: SesVerifyStatus;
+  mailFromStatus?: SesVerifyStatus;
+  dmarcStatus?: DnsRecord["status"];
+}): DnsRecord[] {
+  const dkim = recordStatus(params.dkimStatus);
+  const mailFrom = recordStatus(params.mailFromStatus);
+  const records: DnsRecord[] = params.tokens.map((token) => ({
+    type: "CNAME",
+    name: `${token}._domainkey.${params.name}`,
+    value: `${token}.dkim.amazonses.com`,
+    ttl: 300,
+    purpose: "DKIM",
+    required: true,
+    status: dkim,
+  }));
+  records.push({
+    type: "MX",
+    name: params.mailFromDomain,
+    value: `feedback-smtp.${params.region}.amazonses.com`,
+    priority: 10,
+    ttl: 300,
+    purpose: "MAIL_FROM_MX",
+    required: true,
+    status: mailFrom,
+  });
+  records.push({
+    type: "TXT",
+    name: params.mailFromDomain,
+    value: "v=spf1 include:amazonses.com ~all",
+    ttl: 300,
+    purpose: "MAIL_FROM_SPF",
+    required: true,
+    status: mailFrom,
+  });
+  records.push({
+    type: "TXT",
+    name: `_dmarc.${params.name}`,
+    value: "v=DMARC1; p=none;",
+    ttl: 300,
+    purpose: "DMARC",
+    required: false,
+    status: params.dmarcStatus ?? "PENDING",
+  });
+  return records;
+}
+
+/** SES never reports DMARC, so resolve it ourselves. DNS errors are not failures. */
+async function dmarcStatus(
+  name: string,
+  resolveTxt: (hostname: string) => Promise<string[][]>,
+): Promise<DnsRecord["status"]> {
+  try {
+    const answers = await resolveTxt(`_dmarc.${name}`);
+    const found = answers.some((chunks) => chunks.join("").trim().toLowerCase().startsWith("v=dmarc1"));
+    return found ? "VERIFIED" : "PENDING";
+  } catch {
+    return "PENDING";
+  }
+}
+
+function isAlreadyExists(err: unknown): boolean {
+  return err instanceof AlreadyExistsException || (err as { name?: string })?.name === "AlreadyExistsException";
+}
+
+function isNotFound(err: unknown): boolean {
+  return err instanceof NotFoundException || (err as { name?: string })?.name === "NotFoundException";
+}
+
+function createSesDomainProvisioner(
+  client: SESv2Client,
+  config: SesConfig,
+  resolveTxt: (hostname: string) => Promise<string[][]>,
+): DomainProvisioner {
+  return {
+    async createDomain(name, opts) {
+      let tokens: string[] = [];
+      try {
+        const res = await client.send(
+          new CreateEmailIdentityCommand({
+            EmailIdentity: name,
+            ConfigurationSetName: config.configurationSet,
+            DkimSigningAttributes: { NextSigningKeyLength: "RSA_2048_BIT" },
+          }),
+        );
+        tokens = res.DkimAttributes?.Tokens ?? [];
+      } catch (err) {
+        // Idempotent: an identity we (or someone) already created still has to
+        // hand back its DKIM tokens.
+        if (!isAlreadyExists(err)) throw err;
+        const existing = await client.send(new GetEmailIdentityCommand({ EmailIdentity: name }));
+        tokens = existing.DkimAttributes?.Tokens ?? [];
+      }
+
+      await client.send(
+        new PutEmailIdentityMailFromAttributesCommand({
+          EmailIdentity: name,
+          MailFromDomain: opts.mailFromDomain,
+          BehaviorOnMxFailure: "USE_DEFAULT_VALUE",
+        }),
+      );
+
+      return {
+        records: buildRecords({
+          name,
+          mailFromDomain: opts.mailFromDomain,
+          region: config.region,
+          tokens,
+        }),
+      };
+    },
+
+    async checkDomain(name, opts) {
+      let res;
+      try {
+        res = await client.send(new GetEmailIdentityCommand({ EmailIdentity: name }));
+      } catch (err) {
+        if (isNotFound(err)) {
+          return { status: "FAILED" as DomainStatus, records: [], error: "identity not found at provider" };
+        }
+        throw err;
+      }
+
+      const dkim = res.DkimAttributes?.Status as SesVerifyStatus | undefined;
+      const mailFrom = res.MailFromAttributes?.MailFromDomainStatus as SesVerifyStatus | undefined;
+      const dmarc = await dmarcStatus(name, resolveTxt);
+
+      const records = buildRecords({
+        name,
+        mailFromDomain: res.MailFromAttributes?.MailFromDomain ?? opts.mailFromDomain,
+        region: config.region,
+        tokens: res.DkimAttributes?.Tokens ?? [],
+        dkimStatus: dkim,
+        mailFromStatus: mailFrom,
+        dmarcStatus: dmarc,
+      });
+
+      let status: DomainStatus;
+      let error: string | undefined;
+      if (dkim === "SUCCESS" && mailFrom === "SUCCESS") {
+        status = "VERIFIED";
+      } else if (dkim === "FAILED" || mailFrom === "FAILED") {
+        status = "FAILED";
+        error = [
+          dkim === "FAILED" ? "DKIM verification failed" : null,
+          mailFrom === "FAILED" ? "MAIL FROM verification failed" : null,
+        ]
+          .filter(Boolean)
+          .join("; ");
+      } else if (dkim === "TEMPORARY_FAILURE" || mailFrom === "TEMPORARY_FAILURE") {
+        status = "TEMPORARY_FAILURE";
+        error = "provider reported a temporary failure; still retrying";
+      } else {
+        status = "PENDING";
+      }
+      return { status, records, error };
+    },
+
+    async deleteDomain(name) {
+      try {
+        await client.send(new DeleteEmailIdentityCommand({ EmailIdentity: name }));
+      } catch (err) {
+        if (!isNotFound(err)) throw err;
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Carrier
 // ---------------------------------------------------------------------------
 
-export function createSesCarrier(config: SesConfig): Carrier {
-  const client = new SESv2Client({
-    region: config.region,
-    credentials: {
-      accessKeyId: config.accessKeyId,
-      secretAccessKey: config.secretAccessKey,
-    },
-  });
+export interface SesCarrierDeps {
+  /** Injected in tests so no AWS call is ever made. */
+  client?: SESv2Client;
+  /** Injected in tests; defaults to node:dns/promises resolveTxt. */
+  resolveTxt?: (hostname: string) => Promise<string[][]>;
+}
+
+export function createSesCarrier(config: SesConfig, deps: SesCarrierDeps = {}): Carrier {
+  const client =
+    deps.client ??
+    new SESv2Client({
+      region: config.region,
+      credentials: {
+        accessKeyId: config.accessKeyId,
+        secretAccessKey: config.secretAccessKey,
+      },
+    });
+  const resolveTxt = deps.resolveTxt ?? dnsResolveTxt;
 
   return {
     type: "ses",
+
+    domains: createSesDomainProvisioner(client, config, resolveTxt),
+
+    async accountQuota() {
+      const res = await client.send(new GetAccountCommand({}));
+      return {
+        production_access: res.ProductionAccessEnabled ?? false,
+        max_24h_send: res.SendQuota?.Max24HourSend ?? null,
+        max_send_rate: res.SendQuota?.MaxSendRate ?? null,
+        sent_last_24h: res.SendQuota?.SentLast24Hours ?? null,
+      };
+    },
 
     async send(msg: OutboundMessage) {
       if (msg.attachments.length && !("AttachmentContentDisposition" in sesv2)) {

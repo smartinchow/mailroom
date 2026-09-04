@@ -86,3 +86,15 @@ export async function toggleCarrier(formData: FormData) {
   revalidatePath("/settings/carriers");
   revalidatePath("/");
 }
+
+/** Make this carrier the platform default for new domains (server clears the flag elsewhere). */
+export async function makeDefaultCarrier(formData: FormData) {
+  const id = str(formData, "id");
+  if (!id) return;
+  await api(`/carriers/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ isDefault: true }),
+  });
+  revalidatePath("/settings/carriers");
+  revalidatePath("/settings/domains");
+}

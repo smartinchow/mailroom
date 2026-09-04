@@ -7,10 +7,21 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    /** Parsed JSON error body, e.g. `{ error: "domain_exists" }`, when the response was JSON. */
+    public body?: unknown,
   ) {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/** Read the `error` code off an admin API error body, e.g. "domain_exists". */
+export function apiErrorCode(err: unknown): string | undefined {
+  if (err instanceof ApiError && err.body && typeof err.body === "object") {
+    const code = (err.body as { error?: unknown }).error;
+    if (typeof code === "string") return code;
+  }
+  return undefined;
 }
 
 function requireEnv(name: "API_URL" | "ADMIN_API_TOKEN"): string {
@@ -38,7 +49,13 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new ApiError(res.status, `Admin API ${res.status} on ${path}: ${text.slice(0, 300)}`);
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : undefined;
+    } catch {
+      body = undefined;
+    }
+    throw new ApiError(res.status, `Admin API ${res.status} on ${path}: ${text.slice(0, 300)}`, body);
   }
   if (res.status === 204) return undefined as T;
   const text = await res.text();

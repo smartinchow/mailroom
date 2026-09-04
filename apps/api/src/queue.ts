@@ -30,7 +30,15 @@ export async function enqueueSend(data: SendJobData): Promise<void> {
   await sendQueue.add("send", data);
 }
 
-/** Nightly retention purge (design §9.3), 03:10 local. */
+/** Repeatable maintenance jobs. Job name is the dispatch key in worker.ts. */
+export const PURGE_BODIES_JOB = "purge-bodies";
+export const DOMAIN_VERIFY_JOB = "domain-verify";
+
+/**
+ * Nightly retention purge (design §10.3) at 03:10 local, plus the five-minute
+ * sending-domain verification sweep (domains spec §7).
+ */
 export async function scheduleMaintenance(): Promise<void> {
-  await maintenanceQueue.upsertJobScheduler("purge-bodies", { pattern: "10 3 * * *" });
+  await maintenanceQueue.upsertJobScheduler(PURGE_BODIES_JOB, { pattern: "10 3 * * *" });
+  await maintenanceQueue.upsertJobScheduler(DOMAIN_VERIFY_JOB, { pattern: "*/5 * * * *" });
 }

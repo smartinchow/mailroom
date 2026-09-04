@@ -2,7 +2,7 @@ import { prisma } from "./db.js";
 import { logger } from "./logger.js";
 
 /**
- * Nightly purge (design §9.3): null bodies older than the project's
+ * Nightly purge (design §10.3): null bodies older than the project's
  * bodyRetentionDays, stamp bodyPurgedAt. Metadata and events are kept.
  */
 export async function purgeExpiredBodies(): Promise<number> {

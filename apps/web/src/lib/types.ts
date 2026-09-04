@@ -139,17 +139,58 @@ export interface Carrier {
   ratePerSecond: number;
   ratePerHour: number;
   createdAt: string;
+  isDefault: boolean;
 }
 
+/**
+ * SES-only. 404 for other carrier types — callers must handle that. The provider can
+ * report `null` for the send-limit fields (e.g. still provisioning) — render "—" for
+ * those, never the literal string "null".
+ */
+export interface CarrierQuota {
+  production_access: boolean;
+  max_24h_send: number | null;
+  max_send_rate: number | null;
+  sent_last_24h: number | null;
+}
+
+export type DomainStatus = "pending" | "verified" | "failed" | "temporary_failure";
+
+export type DnsRecordType = "CNAME" | "MX" | "TXT";
+export type DnsRecordPurpose = "dkim" | "mail_from_mx" | "mail_from_spf" | "dmarc";
+export type DnsRecordStatus = "pending" | "verified" | "failed" | "not_started";
+
+export interface DnsRecord {
+  type: DnsRecordType;
+  name: string;
+  value: string;
+  priority: number | null;
+  ttl: number | null;
+  purpose: DnsRecordPurpose;
+  required: boolean;
+  status: DnsRecordStatus;
+}
+
+/**
+ * Wire shape from GET/POST /v1/admin/domains (spec docs/specs/domains.md §3, §5): the
+ * spec-defined fields are snake_case, but the admin-only extras (projectSlug,
+ * fallbackCarrierId, notes) are camelCase as shipped by the admin API — this mixed casing
+ * is the fixed contract, not an inconsistency to "fix".
+ */
 export interface Domain {
   id: string;
   name: string;
-  projectId: string | null;
+  status: DomainStatus;
+  carrier: { id: string; name: string; type: CarrierType };
+  project_id: string | null;
+  mail_from_domain: string | null;
+  records: DnsRecord[];
+  verified_at: string | null;
+  last_checked_at: string | null;
+  verification_error: string | null;
+  created_at: string;
   projectSlug: string | null;
-  carrierId: string;
-  carrierName: string;
   fallbackCarrierId: string | null;
-  verifiedAt: string | null;
   notes: string | null;
 }
 

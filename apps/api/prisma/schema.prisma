@@ -19,6 +19,13 @@ enum CarrierType {
   SMTP
 }
 
+enum DomainStatus {
+  PENDING
+  VERIFIED
+  FAILED
+  TEMPORARY_FAILURE
+}
+
 enum MessageStatus {
   QUEUED
   SENDING
@@ -87,6 +94,7 @@ model Carrier {
   name          String      @unique
   configEnc     String
   enabled       Boolean     @default(true)
+  isDefault     Boolean     @default(false)
   ratePerSecond Int         @default(1)
   ratePerHour   Int         @default(100)
   createdAt     DateTime    @default(now())
@@ -97,13 +105,19 @@ model Carrier {
 }
 
 model Domain {
-  id                String    @id @default(cuid())
-  name              String    @unique
+  id                String       @id @default(cuid())
+  name              String       @unique
   projectId         String?
   carrierId         String
   fallbackCarrierId String?
   verifiedAt        DateTime?
   notes             String?
+  status            DomainStatus @default(PENDING)
+  dnsRecords        Json         @default("[]")
+  mailFromDomain    String?
+  lastCheckedAt     DateTime?
+  verificationError String?
+  createdAt         DateTime     @default(now())
 
   project         Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
   carrier         Carrier  @relation("primary", fields: [carrierId], references: [id])

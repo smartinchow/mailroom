@@ -6,8 +6,16 @@ import { newRedis } from "./redis.js";
 import { redis } from "./redis.js";
 import { carrierFor } from "./carriers/index.js";
 import type { OutboundMessage } from "./carriers/types.js";
-import { MAINTENANCE_QUEUE, SEND_QUEUE, sendQueue, type SendJobData } from "./queue.js";
+import {
+  DOMAIN_VERIFY_JOB,
+  MAINTENANCE_QUEUE,
+  PURGE_BODIES_JOB,
+  SEND_QUEUE,
+  sendQueue,
+  type SendJobData,
+} from "./queue.js";
 import { purgeExpiredBodies } from "./purge.js";
+import { verifyPendingDomains } from "./domains.js";
 
 /**
  * Send worker. Rate limits are sliding one-second and one-hour windows in
@@ -208,6 +216,20 @@ async function onSendExhausted(job: Job<SendJobData>, err: Error): Promise<void>
   logger.error({ messageId, err: err.message }, "send exhausted, message FAILED");
 }
 
+/** Maintenance queue fan-out. The repeatable job's name is the dispatch key. */
+async function processMaintenance(job: Job): Promise<void> {
+  switch (job.name) {
+    case DOMAIN_VERIFY_JOB:
+      await verifyPendingDomains();
+      return;
+    case PURGE_BODIES_JOB:
+      await purgeExpiredBodies();
+      return;
+    default:
+      logger.warn({ job: job.name }, "unknown maintenance job");
+  }
+}
+
 export function startWorkers(): { close(): Promise<void> } {
   const sendWorker = new Worker<SendJobData>(SEND_QUEUE, processSend, {
     connection: newRedis(),
@@ -221,7 +243,7 @@ export function startWorkers(): { close(): Promise<void> } {
     }
   });
 
-  const maintenanceWorker = new Worker(MAINTENANCE_QUEUE, async () => purgeExpiredBodies(), {
+  const maintenanceWorker = new Worker(MAINTENANCE_QUEUE, async (job: Job) => processMaintenance(job), {
     connection: newRedis(),
   });
 

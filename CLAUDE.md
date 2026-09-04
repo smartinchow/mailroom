@@ -1,8 +1,8 @@
 # Mailroom
 
 Self-hosted transactional email service fronting a cloud carrier (ACS / SES / SMTP).
-**Design stage — no code exists yet.** Read `docs/DESIGN.md` before proposing anything, and
-`docs/decisions.md` before re-opening a settled question.
+Read `docs/DESIGN.md` before proposing anything, and `docs/decisions.md` before re-opening
+a settled question.
 
 ## Core stance
 
@@ -32,6 +32,15 @@ toward delivering mail directly is out of scope (D-03).
 - **ACS SMTP relay**: `smtp.azurecomm.net:587`, username
   `<acs-resource>.<entra-app-id>.<entra-tenant-id>`, password = Entra app client secret.
   Event Grid reports still fire on this path.
+- **SES sandbox** caps a new account at 200 emails/24h, 1/sec, verified-recipients-only,
+  until AWS approves production access. Check via the admin carrier quota endpoint.
+- **SNS posts `Content-Type: text/plain`**, not JSON — Fastify hands the hook route a
+  string; parse it explicitly.
+- **SES identities are region-bound**; the custom MAIL FROM subdomain is always
+  `send.<domain>` so SPF aligns with the From domain.
+- **`Domain.status` must be `VERIFIED` to send** (D-07 extension) — ACS/SMTP domains are
+  "manual" and land `VERIFIED` at creation; only SES provisions and polls.
+- **Exactly one `Carrier.isDefault`** — new domains provision against it; enforce in code.
 
 ## Non-negotiables
 

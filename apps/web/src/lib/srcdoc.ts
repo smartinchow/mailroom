@@ -1,5 +1,5 @@
 /**
- * SECURITY-CRITICAL (design §9.4): stored bodies contain live magic-link and
+ * SECURITY-CRITICAL (design §10.4): stored bodies contain live magic-link and
  * invite tokens and arbitrary third-party HTML. They may only ever be rendered
  * inside <iframe sandbox=""> (no allow-scripts, no allow-same-origin) via
  * srcdoc, with a CSP that blocks everything by default. Remote images are

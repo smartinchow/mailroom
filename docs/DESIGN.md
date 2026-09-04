@@ -77,8 +77,15 @@ Plaintext shown once at creation. `keyHash` = SHA-256; compared in constant time
 `configEnc` is AES-256-GCM at rest, key-versioned (`<keyId>.<iv>.<tag>.<ct>`) so credentials
 can be rotated without downtime.
 
-**Domain** — `id, name (unique), projectId?, carrierId, fallbackCarrierId?, verifiedAt, notes`
-`projectId = null` means the domain is shared across projects.
+**Domain** — `id, name (unique), projectId?, carrierId, fallbackCarrierId?, status
+(PENDING|VERIFIED|FAILED|TEMPORARY_FAILURE), dnsRecords (DnsRecord[] json), mailFromDomain?,
+verifiedAt?, lastCheckedAt?, verificationError?, notes, createdAt`
+`projectId = null` means the domain is shared across projects. `status` gates sending
+(D-07 extension, §9); carriers whose adapter implements `domains` (SES) provision and issue
+`dnsRecords` to publish, others (ACS, SMTP) are "manual" and land `VERIFIED` at creation.
+
+**Carrier** gains `isDefault` — exactly one carrier may be the default new domains
+provision against; enforced in code, not the database.
 
 **Message** — the log row.
 `id (ULID), projectId, domainId, carrierId, idempotencyKey?, from, to[], cc[], bcc[],
@@ -223,7 +230,36 @@ rather than implying delivery. Used for Mailpit in development, and as an escape
 - Retries: exponential backoff with jitter, max 5 attempts, retry only on 429/5xx/network.
   Exhausted → `FAILED` + event + `lastError`. Never silently drop.
 
-## 9. Content retention — security-critical
+## 9. Domain verification
+
+Mailroom provisions and verifies sending domains itself, Resend-style, on top of whichever
+carrier is marked default (§5) — the platform Amazon SES carrier out of the box. Mailroom
+still never signs DKIM or touches DNS (D-03, D-14); it only asks the carrier to create the
+identity and reports back the records a human must publish.
+
+Flow:
+
+1. **Create.** `POST /v1/domains { "name" }` resolves the project's default carrier, asks
+   its `DomainProvisioner.createDomain()` for the identity, and stores the returned
+   `DnsRecord[]` with `status = PENDING`. A carrier without a `domains` provisioner (ACS,
+   SMTP) is "manual": the domain is marked `VERIFIED` immediately, no records issued —
+   these carriers keep working exactly as before.
+2. **Records.** Each record carries `type`, `name`, `value`, an optional `priority`/`ttl`,
+   a `purpose` (`DKIM | MAIL_FROM_MX | MAIL_FROM_SPF | DMARC`), whether it's `required`,
+   and its own per-record `status`. The dashboard renders these as a copyable table; DMARC
+   is recommended, not required, to keep the happy path to "3 CNAMEs + 1 MX + 1 TXT".
+3. **Poll.** A repeatable BullMQ job re-checks every `PENDING`/`TEMPORARY_FAILURE` domain
+   on a provisioning carrier every 5 minutes via `checkDomain()`, sequentially per carrier
+   to respect provider rate limits. `POST /v1/domains/:id/verify` runs the same check
+   on demand. A domain stuck unverified for 72h flips to `FAILED`; re-running `verify`
+   resets the window and restarts checking, matching Resend's UX.
+4. **Gate.** `status !== VERIFIED` blocks sending from that domain (D-07 extension): the
+   send route returns `403 domain_not_verified` before it ever reaches a carrier, so an
+   unverified domain cannot leak a partially-configured send.
+5. **Manual carriers.** ACS and SMTP domains carry no records and no polling — they are
+   `VERIFIED` at creation and behave exactly as they did before this feature existed.
+
+## 10. Content retention — security-critical
 
 Stored HTML is not inert data. Application email routinely embeds **live credentials**:
 magic links, onboarding-invite tokens, document-request tokens, reliance-share tokens.
@@ -252,7 +288,7 @@ Design consequences, all defaults-on:
    payloads, no body in metrics, no body in Sentry.
 6. **No bulk body export** through the API or the dashboard. One message at a time.
 
-## 10. Dashboard
+## 11. Dashboard
 
 Next.js, read-mostly.
 
@@ -268,7 +304,7 @@ Next.js, read-mostly.
   Deliberately **not** GitHub-OAuth-only, which is useSend's most-complained-about
   constraint.
 
-## 11. Client SDK
+## 12. Client SDK
 
 `@mailroom/client` — a ~60-line typed fetch wrapper, no dependencies.
 
@@ -280,7 +316,7 @@ await mail.send({ from, to, subject, html, replyTo, idempotencyKey, tags: { temp
 Signature intentionally matches the shape existing callers already pass, so adopting
 Mailroom is a transport swap with zero template changes.
 
-## 12. Deployment
+## 13. Deployment
 
 `docker compose` with `mailroom-api`, `mailroom-web`, `postgres:18-alpine`, `redis`.
 Designed to sit on an existing box behind a shared reverse proxy on a shared network,
@@ -299,14 +335,14 @@ OIDC_ISSUER= OIDC_CLIENT_ID= OIDC_CLIENT_SECRET=   # optional
 Carrier credentials live in the database (encrypted), not in env, so a new domain or a key
 rotation is a UI action rather than a redeploy.
 
-## 13. Observability
+## 14. Observability
 
 `/metrics`: `mailroom_messages_total{carrier,status}`,
 `mailroom_send_duration_seconds{carrier}`, `mailroom_queue_depth{queue}`,
 `mailroom_event_lag_seconds{carrier}`, `mailroom_suppressions_total{reason}`.
 Structured JSON logs keyed by `messageId`. Optional Sentry DSN, `sendDefaultPii: false`.
 
-## 14. Adopting it from an existing app
+## 15. Adopting it from an existing app
 
 1. Deploy Mailroom, add the ACS carrier, add the domain, create a project + API key.
 2. In the app, put the transport behind a flag: `MAIL_TRANSPORT=resend|mailroom`.
@@ -314,7 +350,7 @@ Structured JSON logs keyed by `messageId`. Optional Sentry DSN, `sendDefaultPii:
    counts before trusting it.
 4. Flip the flag. Keep the old credentials for rollback for one more month.
 
-## 15. Milestones
+## 16. Milestones
 
 | # | Deliverable |
 |---|---|
@@ -326,7 +362,7 @@ Structured JSON logs keyed by `messageId`. Optional Sentry DSN, `sendDefaultPii:
 | M5 | `@mailroom/client`, API keys UI, metrics |
 | M6 | First real application cut over |
 
-## 16. Open questions
+## 17. Open questions
 
 1. **Licence** — AGPL-3.0 proposed (matches the peer set, discourages a hosted rip).
    Apache-2.0 if wider corporate adoption matters more. See `docs/decisions.md` D-08.

@@ -1,11 +1,48 @@
-import { api } from "@/lib/api";
+import { ApiError, api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import { CopyButton } from "@/components/CopyButton";
-import type { Carrier, HookUrls } from "@/lib/types";
-import { createCarrier, toggleCarrier, updateCarrier } from "./actions";
+import type { Carrier, CarrierQuota, HookUrls } from "@/lib/types";
+import { createCarrier, makeDefaultCarrier, toggleCarrier, updateCarrier } from "./actions";
 import { ConfigFields, NewCarrierForm } from "./ConfigFields";
 
 export const dynamic = "force-dynamic";
+
+/** SES-only quota panel. Renders a quiet fallback instead of throwing when the carrier
+ * isn't SES (404) or the provider call fails — this is a nice-to-have, not load-bearing. */
+async function QuotaPanel({ carrierId }: { carrierId: string }) {
+  try {
+    const quota = await api<CarrierQuota>(`/carriers/${encodeURIComponent(carrierId)}/quota`);
+    return (
+      <div className="mt-3 grid grid-cols-2 gap-3 border-t border-zinc-100 pt-3 text-xs dark:border-zinc-800 sm:grid-cols-4">
+        <div>
+          <p className="text-zinc-500 dark:text-zinc-400">Production access</p>
+          <p className="mt-0.5 font-medium">{quota.production_access ? "yes" : "sandbox"}</p>
+        </div>
+        <div>
+          <p className="text-zinc-500 dark:text-zinc-400">Max 24h send</p>
+          <p className="mt-0.5 font-medium">{quota.max_24h_send ?? "—"}</p>
+        </div>
+        <div>
+          <p className="text-zinc-500 dark:text-zinc-400">Max send rate</p>
+          <p className="mt-0.5 font-medium">
+            {quota.max_send_rate === null ? "—" : `${quota.max_send_rate}/s`}
+          </p>
+        </div>
+        <div>
+          <p className="text-zinc-500 dark:text-zinc-400">Sent last 24h</p>
+          <p className="mt-0.5 font-medium">{quota.sent_last_24h ?? "—"}</p>
+        </div>
+      </div>
+    );
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    return (
+      <p className="mt-3 border-t border-zinc-100 pt-3 text-xs text-zinc-500 dark:border-zinc-800 dark:text-zinc-400">
+        Quota unavailable.
+      </p>
+    );
+  }
+}
 
 export default async function CarriersPage() {
   const [carriers, hookUrls] = await Promise.all([
@@ -56,6 +93,11 @@ export default async function CarriersPage() {
                   <span className="ml-1 rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-xs dark:bg-zinc-800">
                     {c.type}
                   </span>
+                  {c.isDefault && (
+                    <span className="ml-1 rounded-full bg-sky-100 px-2 py-0.5 text-xs font-semibold text-sky-800 dark:bg-sky-900 dark:text-sky-200">
+                      default
+                    </span>
+                  )}
                 </p>
                 <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
                   {c.ratePerSecond}/s · {c.ratePerHour}/h · created {formatDate(c.createdAt)}
@@ -70,6 +112,14 @@ export default async function CarriersPage() {
               >
                 {c.enabled ? "enabled" : "disabled"}
               </span>
+              {!c.isDefault && (
+                <form action={makeDefaultCarrier}>
+                  <input type="hidden" name="id" value={c.id} />
+                  <button type="submit" className="btn px-2 py-1 text-xs">
+                    Make default
+                  </button>
+                </form>
+              )}
               <form action={toggleCarrier}>
                 <input type="hidden" name="id" value={c.id} />
                 <input type="hidden" name="enabled" value={String(!c.enabled)} />
@@ -78,6 +128,8 @@ export default async function CarriersPage() {
                 </button>
               </form>
             </div>
+
+            {c.type === "SES" && <QuotaPanel carrierId={c.id} />}
 
             <details className="mt-3 border-t border-zinc-100 pt-3 dark:border-zinc-800">
               <summary className="cursor-pointer text-sm font-medium">Edit</summary>

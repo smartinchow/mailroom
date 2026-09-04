@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { buildBodySrcdoc } from "@/lib/srcdoc";
 
 /**
- * SECURITY-CRITICAL (design §9.4). Stored bodies carry live magic-link /
+ * SECURITY-CRITICAL (design §10.4). Stored bodies carry live magic-link /
  * invite tokens and untrusted third-party HTML. Rendering rules:
  *   - <iframe sandbox=""> — empty sandbox: no scripts, no same-origin, no
  *     forms, no popups. Never add sandbox tokens here.

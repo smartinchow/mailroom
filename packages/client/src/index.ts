@@ -68,6 +68,69 @@ export interface ListEmailsResult {
   [key: string]: unknown;
 }
 
+/** Lower-cased on the wire: `pending | verified | failed | temporary_failure`. */
+export type DomainStatus = "pending" | "verified" | "failed" | "temporary_failure";
+
+/** Lower-cased on the wire: `dkim | mail_from_mx | mail_from_spf | dmarc`. */
+export type DnsRecordPurpose = "dkim" | "mail_from_mx" | "mail_from_spf" | "dmarc";
+
+/** One DNS record to publish for domain verification. */
+export interface DnsRecord {
+  type: "CNAME" | "MX" | "TXT";
+  name: string;
+  value: string;
+  priority?: number | null;
+  ttl?: number | null;
+  purpose: DnsRecordPurpose;
+  required: boolean;
+  status: "pending" | "verified" | "failed" | "not_started";
+}
+
+/** A sending domain: created via `domains.create`, verified via `domains.verify`. */
+export interface Domain {
+  id: string;
+  name: string;
+  status: DomainStatus;
+  carrier: { id: string; name: string; type: string };
+  projectId: string | null;
+  mailFromDomain: string | null;
+  records: DnsRecord[];
+  verifiedAt: string | null;
+  lastCheckedAt: string | null;
+  verificationError: string | null;
+  createdAt: string;
+}
+
+/** Raw (snake_case) wire shape for a domain, as returned by the API. */
+interface WireDomain {
+  id: string;
+  name: string;
+  status: DomainStatus;
+  carrier: { id: string; name: string; type: string };
+  project_id: string | null;
+  mail_from_domain: string | null;
+  records: DnsRecord[];
+  verified_at: string | null;
+  last_checked_at: string | null;
+  verification_error: string | null;
+  created_at: string;
+}
+
+/** snake_case wire domain → camelCase `Domain`. */
+const fromWireDomain = (raw: WireDomain): Domain => ({
+  id: raw.id,
+  name: raw.name,
+  status: raw.status,
+  carrier: raw.carrier,
+  projectId: raw.project_id,
+  mailFromDomain: raw.mail_from_domain,
+  records: raw.records,
+  verifiedAt: raw.verified_at,
+  lastCheckedAt: raw.last_checked_at,
+  verificationError: raw.verification_error,
+  createdAt: raw.created_at,
+});
+
 /** Thrown on any non-2xx response, carrying the HTTP status and the parsed error body. */
 export class MailroomError extends Error {
   readonly status: number;
@@ -127,6 +190,9 @@ export function createMailroom(config: { url: string; apiKey: string }) {
       }
       throw new MailroomError(res.status, errorBody);
     }
+    if (res.status === 204) {
+      return undefined as T;
+    }
     return (await res.json()) as T;
   }
 
@@ -159,6 +225,37 @@ export function createMailroom(config: { url: string; apiKey: string }) {
       }
       const query = qs.toString();
       return request("GET", `/v1/emails${query ? `?${query}` : ""}`);
+    },
+
+    domains: {
+      /** Add a sending domain on the project's default carrier. `POST /v1/domains`. */
+      async create(input: { name: string }): Promise<Domain> {
+        const raw = await request<WireDomain>("POST", "/v1/domains", { body: { name: input.name } });
+        return fromWireDomain(raw);
+      },
+
+      /** List the project's domains. `GET /v1/domains`. */
+      async list(): Promise<{ data: Domain[] }> {
+        const raw = await request<{ data: WireDomain[] }>("GET", "/v1/domains");
+        return { data: raw.data.map(fromWireDomain) };
+      },
+
+      /** Fetch one domain, its records, and verification status. `GET /v1/domains/:id`. */
+      async get(id: string): Promise<Domain> {
+        const raw = await request<WireDomain>("GET", `/v1/domains/${encodeURIComponent(id)}`);
+        return fromWireDomain(raw);
+      },
+
+      /** Re-check verification now. `POST /v1/domains/:id/verify`. */
+      async verify(id: string): Promise<Domain> {
+        const raw = await request<WireDomain>("POST", `/v1/domains/${encodeURIComponent(id)}/verify`);
+        return fromWireDomain(raw);
+      },
+
+      /** Remove a domain. `DELETE /v1/domains/:id` → 204, no body. */
+      remove(id: string): Promise<void> {
+        return request<void>("DELETE", `/v1/domains/${encodeURIComponent(id)}`);
+      },
     },
   };
 }

@@ -99,6 +99,33 @@ Open the dashboard, then:
 2. Add your **sending domain** and bind it to the carrier.
 3. Create a **project** and an **API key**. The key is shown once.
 
+### Add and verify your domain
+
+If your carrier provisions domains (the platform SES carrier does; ACS/SMTP carriers are
+"manual" and skip straight to verified), add the domain through the API and publish the
+records it hands back before your first send:
+
+```sh
+curl -X POST "$MAILROOM_URL/v1/domains" \
+  -H "Authorization: Bearer mr_live_..." \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "acme.example" }'
+# → 201 { "id": "…", "name": "acme.example", "status": "pending", "records": [ … ] }
+```
+
+Each returned record has a `type` (`CNAME|MX|TXT`), `name`, `value`, `purpose`
+(`dkim|mail_from_mx|mail_from_spf|dmarc`), and `required` — publish every `required: true`
+record at your DNS provider (Cloudflare users: leave the DKIM CNAMEs **DNS only**, not
+proxied). Mailroom re-checks every 5 minutes on its own, or check on demand:
+
+```sh
+curl -X POST "$MAILROOM_URL/v1/domains/<id>/verify" -H "Authorization: Bearer mr_live_..."
+# → 200 { "status": "verified", … }
+```
+
+Sending from a domain that hasn't reached `verified` is rejected with `403
+domain_not_verified` — see [Domain verification](docs/DESIGN.md#9-domain-verification).
+
 Send with curl:
 
 ```sh
@@ -154,6 +181,11 @@ Non-2xx responses throw a `MailroomError` carrying `status` and the parsed error
 | `GET /v1/suppressions` | API key | List suppressions. |
 | `POST /v1/suppressions` | API key | Add a suppression. |
 | `DELETE /v1/suppressions/:address` | API key | Remove a suppression. |
+| `POST /v1/domains` | API key | Add a sending domain on the project's default carrier. → `201` domain + DNS records. |
+| `GET /v1/domains` | API key | List the project's domains. |
+| `GET /v1/domains/:id` | API key | Fetch one domain, its records, and verification status. |
+| `POST /v1/domains/:id/verify` | API key | Re-check verification now (also restarts an expired 72h window). |
+| `DELETE /v1/domains/:id` | API key | Remove a domain. `409 domain_in_use` if messages reference it. |
 | `POST /v1/hooks/acs/:endpointSecret` | URL secret + topic check | ACS Event Grid delivery/engagement events. |
 | `POST /v1/hooks/ses/:endpointSecret` | URL secret + SNS signature | SES event notifications via SNS. |
 | `GET /health` | — | `{ db, redis, carriers[] }` |
@@ -181,12 +213,32 @@ project), `409 suppressed` (recipient is on the suppression list).
 
 ### Amazon SES
 
-- Sends use SES v2 with a **configuration set** whose event destination publishes to an
-  SNS topic; subscribe that topic (HTTPS) to
-  `https://<your-host>/v1/hooks/ses/<endpointSecret>`.
-- Mailroom confirms the SNS subscription automatically and **verifies every SNS message
+- **IAM.** A dedicated IAM user (e.g. `mailroom-ses`) with an inline policy scoped to
+  sending — `ses:SendEmail`, `ses:SendRawEmail` — plus identity management so Mailroom can
+  provision domains on your behalf: `CreateEmailIdentity`, `DeleteEmailIdentity`,
+  `GetEmailIdentity`, `ListEmailIdentities`, `PutEmailIdentityMailFromAttributes`,
+  `PutEmailIdentityDkimAttributes`, `PutEmailIdentityDkimSigningAttributes`,
+  `PutEmailIdentityConfigurationSetAttributes`, `PutEmailIdentityFeedbackAttributes`,
+  `TagResource`, `GetAccount`, `GetConfigurationSet`. No key values belong in this repo or
+  its docs — generate and store them as a Mailroom carrier config (encrypted at rest).
+- **Configuration set + events.** Sends use SES v2 with a configuration set (reputation
+  metrics on) whose event destination publishes `BOUNCE, COMPLAINT, DELIVERY, REJECT,
+  DELIVERY_DELAY, RENDERING_FAILURE` to an SNS topic; subscribe that topic (HTTPS) to
+  `https://<your-host>/v1/hooks/ses/<endpointSecret>`. Mailroom confirms the SNS
+  subscription automatically (fetches `SubscribeURL`) and **verifies every SNS message
   signature** against the published certificate — an unverified SNS endpoint would accept
-  forged bounce/complaint events.
+  forged bounce/complaint events. Note SNS posts with `Content-Type: text/plain`, not JSON.
+- **Sandbox limits.** A new SES account starts in the sandbox: 200 emails/24h, 1/sec, and
+  every recipient must itself be a verified identity, until AWS approves a production
+  access request. Check current quota via the admin carrier quota endpoint
+  (`GetAccount`) rather than assuming it's been lifted.
+- **Domain provisioning.** Mailroom requests Easy DKIM (3 CNAMEs to `*.dkim.amazonses.com`)
+  and a custom MAIL FROM subdomain `send.<domain>` (MX `feedback-smtp.<region
+  >.amazonses.com` priority 10, TXT `v=spf1 include:amazonses.com ~all`) plus a recommended
+  DMARC TXT — see [Add and verify your domain](#add-and-verify-your-domain). SES identities
+  are **region-bound**: a domain verified in `ap-southeast-2` is not verified in another
+  region. Cloudflare users must leave the DKIM CNAMEs un-proxied (DNS only). The
+  verification window is 72h; re-run `verify` to restart it.
 - Permanent bounces and complaints are auto-added to the suppression list. Region is
   per-carrier config (e.g. `ap-southeast-2` for Australian data residency).
 - On AWS, SES sends and SNS only reports — SNS is not a sending provider.

@@ -40,6 +40,7 @@ const CARRIER = {
   name: "test-carrier",
   configEnc: "v1.aa.bb.cc",
   enabled: true,
+  isDefault: false,
   ratePerSecond: 1,
   ratePerHour: 100,
   createdAt: new Date(),
@@ -53,6 +54,12 @@ const DOMAIN = {
   fallbackCarrierId: null,
   verifiedAt: new Date(),
   notes: null,
+  status: "VERIFIED" as const,
+  dnsRecords: [],
+  mailFromDomain: null,
+  lastCheckedAt: null,
+  verificationError: null,
+  createdAt: new Date(),
   carrier: CARRIER,
 };
 

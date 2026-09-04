@@ -29,11 +29,19 @@ export function registerHookRoutes(app: FastifyInstance): void {
       return reply.code(202).send({ ok: true });
     }
 
-    const raw: RawRequest = {
-      headers: req.headers,
-      body: req.body,
-      rawBody: (req as { rawBody?: string }).rawBody,
-    };
+    // SNS posts JSON with Content-Type text/plain; Fastify's default parser
+    // then hands us a string, which the adapter treats as the raw body.
+    let body: unknown = req.body;
+    let rawBody = (req as { rawBody?: string }).rawBody;
+    if (typeof req.body === "string") {
+      rawBody = req.body;
+      try {
+        body = JSON.parse(req.body);
+      } catch {
+        return reply.code(400).send({ error: "invalid_json" });
+      }
+    }
+    const raw: RawRequest = { headers: req.headers, body, rawBody };
 
     let lastReason = "no carrier verified this payload";
     for (const row of rows) {
@@ -47,7 +55,7 @@ export function registerHookRoutes(app: FastifyInstance): void {
         // Event Grid subscription validation / SNS subscription confirmation.
         return reply.code(200).send(verdict.respondWith);
       }
-      const events = carrier.parseEvents(req.body);
+      const events = carrier.parseEvents(body);
       await ingestEvents(row.type, events);
       return reply.code(200).send({ ok: true, ingested: events.length });
     }

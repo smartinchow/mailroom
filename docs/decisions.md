@@ -156,7 +156,7 @@ versions).
 **Decided.** Mailroom adds domains the way resend.com does: a project calls `POST
 /v1/domains` with just a name, gets back the DNS records to publish, and Mailroom polls the
 carrier every 5 minutes until it reports verified. One platform-level Amazon SES carrier
-(account 541165757072, `ap-southeast-2`, configuration set `mailroom`) is marked the
+(Consultin AWS account, `ap-southeast-2`, configuration set `mailroom`) is marked the
 default carrier that new domains provision against; ACS and SMTP domains stay "manual" —
 verified at creation, no records, no polling — so existing production senders (tx.amlify.au,
 tintinpos.com, maro.com.au) are unaffected. Rejected: a per-project AWS account per

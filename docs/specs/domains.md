@@ -7,7 +7,7 @@ Status: approved for implementation 2026-09-04. Owner: Mailroom.
 Any project can add its own sending domain to Mailroom, receive the DNS records it must
 publish, and have Mailroom verify the domain against the carrier — exactly the flow
 resend.com offers. One platform-level Amazon SES carrier (`ses-mailroom`,
-account 541165757072, region `ap-southeast-2`, configuration set `mailroom`) is the
+the Consultin AWS account, region `ap-southeast-2`, configuration set `mailroom`) is the
 default carrier for every new domain. ACS and SMTP carriers keep working unchanged.
 
 Non-goals: Mailroom never signs DKIM or touches DNS itself (D-03). No automatic DNS

@@ -150,6 +150,14 @@ export interface AcsArmConfig {
   emailServiceName: string;
   /** Communication Service resource the verified domain is linked to. */
   communicationServiceName: string;
+  /**
+   * Local parts registered as senders on every domain this carrier provisions.
+   * ACS rejects a send from an unregistered username, and the failure only
+   * shows up at send time, so a project sending as `support@` must have it
+   * listed. Omit to get the `noreply`/`donotreply` defaults. Entries may be a
+   * bare string or `{ username, displayName }`.
+   */
+  senderUsernames?: (string | { username: string; displayName?: string })[];
 }
 
 /** Decrypted per-carrier configuration shapes (stored AES-256-GCM in Carrier.configEnc). */

@@ -83,9 +83,13 @@ interface Route {
 /** No TXT records published: the greenfield case, so SPF stays ACS's stock value. */
 const noTxt = async () => [] as string[][];
 
-function fakeArm(routes: Route[], resolveTxt: (h: string) => Promise<string[][]> = noTxt) {
+function fakeArm(
+  routes: Route[],
+  resolveTxt: (h: string) => Promise<string[][]> = noTxt,
+  arm: AcsArmConfig = ARM,
+) {
   const calls: Call[] = [];
-  const provisioner = createAcsDomainProvisioner(ARM, {
+  const provisioner = createAcsDomainProvisioner(arm, {
     sleep: async () => {},
     resolveTxt,
     async fetch(url, init) {
@@ -364,7 +368,7 @@ describe("checkDomain state machine", () => {
 describe("checkDomain when all four verify", () => {
   const allVerified = states("Verified", "Verified", "Verified", "Verified");
 
-  function verifiedArm(linked: string[]) {
+  function verifiedArm(linked: string[], arm: AcsArmConfig = ARM) {
     const state = { linked: [...linked] };
     const { provisioner, calls } = fakeArm([
       { match: `PUT ${ARM_BASE}`, reply: () => ({}) },
@@ -374,7 +378,7 @@ describe("checkDomain when all four verify", () => {
         } },
       { match: `GET ${ARM_BASE}/subscriptions/sub-1/resourceGroups/rg-amlify-email/providers/Microsoft.Communication/${ACS_PATH}`, reply: () => ({ properties: { linkedDomains: state.linked } }) },
       { match: `GET ${ARM_BASE}`, reply: () => domainResource(allVerified) },
-    ]);
+    ], noTxt, arm);
     return { provisioner, calls, state };
   }
 
@@ -390,6 +394,34 @@ describe("checkDomain when all four verify", () => {
       .filter((c) => c.method === "PUT" && c.url.includes("/senderUsernames/"))
       .map((c) => c.body.properties.username);
     expect(senders).toEqual(["noreply", "donotreply"]);
+  });
+
+  // ACS rejects a send from an unregistered username and only says so at send
+  // time, so a project sending as support@ must be able to configure it.
+  it("registers the configured sender usernames instead of the defaults", async () => {
+    const { provisioner, calls } = verifiedArm(EXISTING_LINKED, {
+      ...ARM,
+      senderUsernames: ["support", { username: "sales", displayName: "Sales" }],
+    });
+    await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN });
+
+    const puts = armCalls(calls).filter((c) => c.method === "PUT" && c.url.includes("/senderUsernames/"));
+    expect(puts.map((c) => c.body.properties.username)).toEqual(["support", "sales"]);
+    expect(puts.map((c) => c.body.properties.displayName)).toEqual(["support", "Sales"]);
+  });
+
+  it("accepts a full address or a display-name form and stores the bare local part", async () => {
+    const { provisioner, calls } = verifiedArm(EXISTING_LINKED, {
+      ...ARM,
+      senderUsernames: ["support@tintinpos.com", "Help <help@tintinpos.com>", "support"],
+    });
+    await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN });
+
+    const senders = armCalls(calls)
+      .filter((c) => c.method === "PUT" && c.url.includes("/senderUsernames/"))
+      .map((c) => c.body.properties.username);
+    // Deduplicated: "support@tintinpos.com" and "support" are the same sender.
+    expect(senders).toEqual(["support", "help"]);
   });
 
   it("APPENDS to linkedDomains — the live senders already there survive", async () => {

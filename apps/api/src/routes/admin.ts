@@ -34,6 +34,14 @@ const carrierConfigSchema = z.discriminatedUnion("type", [
         resourceGroup: z.string().min(1),
         emailServiceName: z.string().min(1),
         communicationServiceName: z.string().min(1),
+        senderUsernames: z
+          .array(
+            z.union([
+              z.string().min(1),
+              z.object({ username: z.string().min(1), displayName: z.string().min(1).optional() }),
+            ]),
+          )
+          .optional(),
       })
       .optional(),
   }),

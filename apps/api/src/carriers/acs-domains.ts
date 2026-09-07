@@ -44,11 +44,37 @@ const TOKEN_SKEW_MS = 60_000;
  * an address whose username is not registered on the domain, so provisioning
  * one is part of making the domain usable. `donotreply` is the ACS default and
  * `noreply` is the house convention (docs/DESIGN.md).
+ *
+ * These are only the defaults. Real projects send from addresses like
+ * `support@` or `sales@`, and a domain whose username is missing here fails at
+ * send time with an ACS validation error rather than anything Mailroom can
+ * see at provisioning time — so the list is overridable per carrier via
+ * `AcsArmConfig.senderUsernames`, editable in the dashboard without a deploy.
  */
-const SENDER_USERNAMES: { username: string; displayName: string }[] = [
+const DEFAULT_SENDER_USERNAMES: { username: string; displayName: string }[] = [
   { username: "noreply", displayName: "No Reply" },
   { username: "donotreply", displayName: "Do Not Reply" },
 ];
+
+/** A username is a bare local part: no `@`, no display name, no spaces. */
+function normalizeSenders(
+  configured: readonly (string | { username: string; displayName?: string })[] | undefined,
+): { username: string; displayName: string }[] {
+  if (!configured?.length) return DEFAULT_SENDER_USERNAMES;
+  const out = new Map<string, { username: string; displayName: string }>();
+  for (const entry of configured) {
+    const raw = typeof entry === "string" ? entry : entry.username;
+    const username = String(raw ?? "")
+      .trim()
+      .replace(/^.*</, "")
+      .split("@")[0]
+      .trim();
+    if (!username) continue;
+    const displayName = (typeof entry === "string" ? undefined : entry.displayName) ?? username;
+    out.set(username.toLowerCase(), { username, displayName });
+  }
+  return out.size ? [...out.values()] : DEFAULT_SENDER_USERNAMES;
+}
 
 /** The four verification types ACS reports records for, in publish order. */
 const RECORD_KEYS = ["Domain", "SPF", "DKIM", "DKIM2"] as const;
@@ -338,6 +364,7 @@ export function createAcsDomainProvisioner(
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = deps.now ?? (() => Date.now());
   const resolveTxt = deps.resolveTxt ?? dnsResolveTxt;
+  const senders = normalizeSenders(arm.senderUsernames);
 
   /** Cached client-credentials token. Never logged, never returned. */
   let token: { value: string; expiresAt: number } | null = null;
@@ -499,7 +526,7 @@ export function createAcsDomainProvisioner(
 
   /** PUT is an upsert, so this is safe to repeat on every later check. */
   async function ensureSenderUsernames(name: string): Promise<void> {
-    for (const sender of SENDER_USERNAMES) {
+    for (const sender of senders) {
       const { headers } = await call("PUT", domainUrl(name, `/senderUsernames/${sender.username}`), {
         properties: { username: sender.username, displayName: sender.displayName },
       });

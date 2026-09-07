@@ -84,6 +84,7 @@ const mockPrisma = {
   carrier: { findUnique: vi.fn(), findFirst: vi.fn() },
   domain: {
     findUnique: vi.fn(),
+    findUniqueOrThrow: vi.fn(),
     findFirst: vi.fn(),
     findMany: vi.fn(),
     count: vi.fn(),
@@ -104,12 +105,23 @@ const provisioner: DomainProvisioner = {
 const mockCarrierFor = vi.fn(() => ({ type: "ses", domains: provisioner }));
 
 vi.mock("../../db.js", () => ({ prisma: mockPrisma }));
+vi.mock("../../queue.js", () => ({
+  enqueueSend: vi.fn(),
+  sendQueue: { getJobCounts: vi.fn(async () => ({})) },
+  maintenanceQueue: {},
+  scheduleMaintenance: vi.fn(),
+  SEND_QUEUE: "send",
+  MAINTENANCE_QUEUE: "maintenance",
+}));
 vi.mock("../../carriers/index.js", () => ({
   carrierFor: (...args: unknown[]) => mockCarrierFor(...(args as [])),
   invalidateCarrierCache: vi.fn(),
 }));
 
 let app: Fastify.FastifyInstance;
+/** The admin surface is a separate app: it authenticates by admin token, not API key. */
+let adminApp: Fastify.FastifyInstance;
+const adminAuth = { "x-admin-token": process.env.ADMIN_API_TOKEN as string };
 
 beforeAll(async () => {
   const FastifyModule = (await import("fastify")).default;
@@ -117,6 +129,11 @@ beforeAll(async () => {
   app = FastifyModule();
   registerDomainRoutes(app);
   await app.ready();
+
+  const { registerAdminRoutes } = await import("../admin.js");
+  adminApp = FastifyModule();
+  registerAdminRoutes(adminApp);
+  await adminApp.ready();
 });
 
 afterEach(() => {
@@ -374,5 +391,167 @@ describe("DELETE /v1/domains/:id", () => {
     const res = await app.inject({ method: "DELETE", url: "/v1/domains/dom_1", headers: auth });
     expect(res.statusCode).toBe(204);
     expect(mockPrisma.domain.delete).toHaveBeenCalled();
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Admin-only: moving a domain to another carrier
+// ---------------------------------------------------------------------------
+
+describe("POST /v1/admin/domains/:id/reprovision", () => {
+  const SMTP_CARRIER_ROW = { ...SES_CARRIER_ROW, id: "car_smtp", type: "SMTP" as const, name: "cpanel-smtp" };
+
+  function smtpDomainRow(overrides: Record<string, unknown> = {}) {
+    return domainRow({
+      carrierId: SMTP_CARRIER_ROW.id,
+      status: "VERIFIED",
+      dnsRecords: [],
+      mailFromDomain: null,
+      verifiedAt: new Date("2026-01-01T00:00:00.000Z"),
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      carrier: { id: SMTP_CARRIER_ROW.id, name: SMTP_CARRIER_ROW.name, type: "SMTP" },
+      ...overrides,
+    });
+  }
+
+  /** SMTP is manual, SES provisions — keyed by row so old and new both resolve. */
+  function adapters() {
+    mockCarrierFor.mockImplementation((row: { id: string }) =>
+      row.id === SES_CARRIER_ROW.id ? { type: "ses", domains: provisioner } : ({ type: "smtp" } as never),
+    );
+    mockPrisma.carrier.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) =>
+      [SES_CARRIER_ROW, SMTP_CARRIER_ROW].find((c) => c.id === where.id) ?? null,
+    );
+  }
+
+  it("rejects a request without the admin token", async () => {
+    const res = await adminApp.inject({
+      method: "POST",
+      url: "/v1/admin/domains/dom_1/reprovision",
+      payload: { carrierId: SES_CARRIER_ROW.id },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("moves the domain onto the target carrier and returns the admin shape", async () => {
+    adapters();
+    mockPrisma.domain.findUnique.mockResolvedValue(smtpDomainRow());
+    mockPrisma.domain.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) =>
+      smtpDomainRow({ ...data, carrier: domainRow().carrier }),
+    );
+    mockPrisma.domain.findUniqueOrThrow.mockImplementation(async () =>
+      domainRow({ status: "PENDING", project: { slug: "amlify" } }),
+    );
+
+    const res = await adminApp.inject({
+      method: "POST",
+      url: "/v1/admin/domains/dom_1/reprovision",
+      headers: adminAuth,
+      payload: { carrierId: SES_CARRIER_ROW.id },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.status).toBe("pending");
+    expect(body.projectSlug).toBe("amlify");
+    expect(body.carrierId).toBe(SES_CARRIER_ROW.id);
+    expect(provisioner.createDomain).toHaveBeenCalledWith("mail.amlify.au", {
+      mailFromDomain: "send.mail.amlify.au",
+    });
+    expect(mockPrisma.domain.update.mock.calls[0][0].data.carrierId).toBe(SES_CARRIER_ROW.id);
+  });
+
+  it("400s a body with no carrierId, without touching the row", async () => {
+    const res = await adminApp.inject({
+      method: "POST",
+      url: "/v1/admin/domains/dom_1/reprovision",
+      headers: adminAuth,
+      payload: {},
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe("invalid_request");
+    expect(mockPrisma.domain.update).not.toHaveBeenCalled();
+    expect(provisioner.createDomain).not.toHaveBeenCalled();
+  });
+
+  it("404s an unknown domain", async () => {
+    adapters();
+    mockPrisma.domain.findUnique.mockResolvedValue(null);
+
+    const res = await adminApp.inject({
+      method: "POST",
+      url: "/v1/admin/domains/dom_missing/reprovision",
+      headers: adminAuth,
+      payload: { carrierId: SES_CARRIER_ROW.id },
+    });
+    expect(res.statusCode).toBe(404);
+    expect(res.json()).toEqual({ error: "not_found" });
+    expect(provisioner.createDomain).not.toHaveBeenCalled();
+  });
+
+  it("502s and leaves the domain on its old carrier when the target refuses", async () => {
+    adapters();
+    mockPrisma.domain.findUnique.mockResolvedValue(smtpDomainRow());
+    (provisioner.createDomain as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("AccessDenied"));
+
+    const res = await adminApp.inject({
+      method: "POST",
+      url: "/v1/admin/domains/dom_1/reprovision",
+      headers: adminAuth,
+      payload: { carrierId: SES_CARRIER_ROW.id },
+    });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json()).toEqual({ error: "provider_error", message: "AccessDenied" });
+    expect(mockPrisma.domain.update).not.toHaveBeenCalled();
+  });
+
+  it("is not exposed on the public API", async () => {
+    authed();
+    const res = await app.inject({
+      method: "POST",
+      url: "/v1/domains/dom_1/reprovision",
+      headers: auth,
+      payload: { carrierId: SES_CARRIER_ROW.id },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  // The dashboard's carrier select posts to PATCH, not to this endpoint. A bare
+  // FK write there would leave the domain VERIFIED but registered nowhere, so
+  // PATCH must provision through the same service.
+  it("PATCH with a new carrierId provisions rather than just moving the FK", async () => {
+    adapters();
+    mockPrisma.domain.findUnique.mockResolvedValue(smtpDomainRow());
+    mockPrisma.domain.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) =>
+      smtpDomainRow({ ...data, carrier: domainRow().carrier }),
+    );
+
+    const res = await adminApp.inject({
+      method: "PATCH",
+      url: "/v1/admin/domains/dom_1",
+      headers: adminAuth,
+      payload: { carrierId: SES_CARRIER_ROW.id, notes: "moved" },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(provisioner.createDomain).toHaveBeenCalledWith("mail.amlify.au", expect.anything());
+  });
+
+  it("PATCH refuses the move when the provider does, leaving the carrier put", async () => {
+    adapters();
+    mockPrisma.domain.findUnique.mockResolvedValue(smtpDomainRow());
+    provisioner.createDomain.mockRejectedValueOnce(new Error("AccessDenied"));
+
+    const res = await adminApp.inject({
+      method: "PATCH",
+      url: "/v1/admin/domains/dom_1",
+      headers: adminAuth,
+      payload: { carrierId: SES_CARRIER_ROW.id },
+    });
+
+    expect(res.statusCode).toBe(502);
+    expect(mockPrisma.domain.update).not.toHaveBeenCalled();
   });
 });

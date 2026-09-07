@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 process.env.DATABASE_URL ??= "postgresql://user:pass@localhost:5432/mailroom_test";
 process.env.REDIS_URL ??= "redis://localhost:6379";
@@ -10,7 +10,8 @@ process.env.LOG_LEVEL ??= "silent";
 
 const mockPrisma = {
   domain: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
-  carrier: { findUnique: vi.fn() },
+  carrier: { findUnique: vi.fn(), findFirst: vi.fn() },
+  message: { count: vi.fn(), update: vi.fn(), updateMany: vi.fn(), deleteMany: vi.fn() },
 };
 const mockCarrierFor = vi.fn();
 
@@ -22,6 +23,7 @@ const {
   EXPIRED_MESSAGE,
   applyExpiry,
   normalizeDomainName,
+  reprovisionDomain,
   toPublicDomain,
   verifyPendingDomains,
 } = await import("../domains.js");
@@ -254,5 +256,224 @@ describe("verifyPendingDomains", () => {
     expect(checkDomain).toHaveBeenNthCalledWith(1, "a.example.com", { mailFromDomain: "send.a.example.com" });
     expect(checkDomain).toHaveBeenNthCalledWith(2, "b.example.com", { mailFromDomain: "send.b.example.com" });
     expect(result).toEqual({ checked: 1, verified: 1, failed: 0 });
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Reprovision (moving a live domain between carriers)
+// ---------------------------------------------------------------------------
+
+describe("reprovisionDomain", () => {
+  const SMTP_ROW = { id: "car_smtp", name: "cpanel-smtp", enabled: true };
+  const SES_ROW = { id: "car_ses", name: "ses-mailroom", enabled: true };
+  const ACS_ROW = { id: "car_acs", name: "acs-amlify", enabled: true };
+
+  const ACS_RECORDS = [
+    {
+      type: "TXT",
+      name: "tintinpos.com",
+      value: "ms-domain-verification=abc",
+      purpose: "DOMAIN_OWNERSHIP",
+      required: true,
+      status: "PENDING",
+    },
+  ];
+
+  /** The domain as it exists today: live on the cPanel SMTP carrier. */
+  function smtpDomain(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "dom_tintin",
+      name: "tintinpos.com",
+      projectId: "proj_1",
+      carrierId: SMTP_ROW.id,
+      fallbackCarrierId: null,
+      verifiedAt: new Date("2026-01-01T00:00:00.000Z"),
+      notes: null,
+      status: "VERIFIED" as const,
+      dnsRecords: [],
+      mailFromDomain: null,
+      lastCheckedAt: null,
+      verificationError: null,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      carrier: { id: SMTP_ROW.id, name: SMTP_ROW.name, type: "SMTP" as const },
+      ...overrides,
+    };
+  }
+
+  const acsProvisioner = {
+    mailFromFor: (name: string) => name,
+    createDomain: vi.fn(),
+    checkDomain: vi.fn(),
+    deleteDomain: vi.fn(),
+  };
+  const sesProvisioner = {
+    mailFromFor: (name: string) => `send.${name}`,
+    createDomain: vi.fn(),
+    checkDomain: vi.fn(),
+    deleteDomain: vi.fn(),
+  };
+
+  /** Carrier rows keyed by id, so both the target and the old carrier resolve. */
+  function carriers(rows: { id: string }[]) {
+    mockPrisma.carrier.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) =>
+      rows.find((r) => r.id === where.id) ?? null,
+    );
+  }
+
+  /** SMTP is manual; SES and ACS provision. */
+  function adapters() {
+    mockCarrierFor.mockImplementation((row: { id: string }) => {
+      if (row.id === ACS_ROW.id) return { type: "acs", domains: acsProvisioner };
+      if (row.id === SES_ROW.id) return { type: "ses", domains: sesProvisioner };
+      return { type: "smtp" };
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    acsProvisioner.createDomain.mockResolvedValue({ records: ACS_RECORDS });
+    acsProvisioner.deleteDomain.mockResolvedValue(undefined);
+    sesProvisioner.createDomain.mockResolvedValue({ records: [] });
+    sesProvisioner.deleteDomain.mockResolvedValue(undefined);
+    mockPrisma.domain.findUnique.mockResolvedValue(smtpDomain());
+    mockPrisma.domain.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) =>
+      smtpDomain(data),
+    );
+    adapters();
+    carriers([SMTP_ROW, SES_ROW, ACS_ROW]);
+  });
+
+  it("registers at the target carrier and lands PENDING with fresh records", async () => {
+    const out = await reprovisionDomain("dom_tintin", ACS_ROW.id);
+
+    expect(acsProvisioner.createDomain).toHaveBeenCalledWith("tintinpos.com", {
+      mailFromDomain: "tintinpos.com",
+    });
+    const { data } = mockPrisma.domain.update.mock.calls[0][0];
+    expect(data.carrierId).toBe(ACS_ROW.id);
+    expect(data.status).toBe("PENDING");
+    expect(data.dnsRecords).toEqual(ACS_RECORDS);
+    expect(data.mailFromDomain).toBe("tintinpos.com");
+    expect(data.verifiedAt).toBeNull();
+    expect(data.verificationError).toBeNull();
+    // The 72h window restarts from the move, not from the 2026-01-01 row.
+    expect(data.createdAt).toBeInstanceOf(Date);
+    expect((data.createdAt as Date).getTime()).toBeGreaterThan(
+      new Date("2026-01-01T00:00:00.000Z").getTime(),
+    );
+    expect(out.status).toBe("PENDING");
+  });
+
+  it("moves onto a manual carrier as VERIFIED with no records", async () => {
+    mockPrisma.domain.findUnique.mockResolvedValue(
+      smtpDomain({
+        carrierId: ACS_ROW.id,
+        status: "PENDING",
+        dnsRecords: ACS_RECORDS,
+        mailFromDomain: "tintinpos.com",
+        carrier: { id: ACS_ROW.id, name: ACS_ROW.name, type: "ACS" },
+      }),
+    );
+
+    await reprovisionDomain("dom_tintin", SMTP_ROW.id);
+
+    const { data } = mockPrisma.domain.update.mock.calls[0][0];
+    expect(data.carrierId).toBe(SMTP_ROW.id);
+    expect(data.status).toBe("VERIFIED");
+    expect(data.dnsRecords).toEqual([]);
+    expect(data.mailFromDomain).toBeNull();
+    expect(data.verifiedAt).toBeInstanceOf(Date);
+    // Nothing to verify upstream, so there is no 72h window to restart.
+    expect(data.createdAt).toBeUndefined();
+  });
+
+  it("leaves the row untouched when the target carrier refuses", async () => {
+    acsProvisioner.createDomain.mockRejectedValue(new Error("ARM 403 AuthorizationFailed"));
+
+    await expect(reprovisionDomain("dom_tintin", ACS_ROW.id)).rejects.toMatchObject({
+      status: 502,
+      code: "provider_error",
+      extra: { message: "ARM 403 AuthorizationFailed" },
+    });
+
+    // The assertion that matters: the carrier did not move, so the domain
+    // keeps sending on SMTP exactly as it did before the attempt.
+    expect(mockPrisma.domain.update).not.toHaveBeenCalled();
+    expect(acsProvisioner.deleteDomain).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when the domain is already on the target carrier", async () => {
+    const out = await reprovisionDomain("dom_tintin", SMTP_ROW.id);
+
+    expect(out.carrierId).toBe(SMTP_ROW.id);
+    expect(out.status).toBe("VERIFIED");
+    expect(mockPrisma.domain.update).not.toHaveBeenCalled();
+    expect(acsProvisioner.createDomain).not.toHaveBeenCalled();
+    expect(sesProvisioner.deleteDomain).not.toHaveBeenCalled();
+  });
+
+  it("deprovisions at the old carrier only after the move is committed", async () => {
+    mockPrisma.domain.findUnique.mockResolvedValue(
+      smtpDomain({ carrierId: SES_ROW.id, carrier: { id: SES_ROW.id, name: SES_ROW.name, type: "SES" } }),
+    );
+
+    await reprovisionDomain("dom_tintin", ACS_ROW.id);
+
+    expect(sesProvisioner.deleteDomain).toHaveBeenCalledWith("tintinpos.com");
+    expect(sesProvisioner.deleteDomain.mock.invocationCallOrder[0]).toBeGreaterThan(
+      mockPrisma.domain.update.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("keeps the move when the old carrier refuses to deprovision", async () => {
+    mockPrisma.domain.findUnique.mockResolvedValue(
+      smtpDomain({ carrierId: SES_ROW.id, carrier: { id: SES_ROW.id, name: SES_ROW.name, type: "SES" } }),
+    );
+    sesProvisioner.deleteDomain.mockRejectedValue(new Error("Throttling"));
+
+    const out = await reprovisionDomain("dom_tintin", ACS_ROW.id);
+
+    expect(out.status).toBe("PENDING");
+    expect(out.carrierId).toBe(ACS_ROW.id);
+    // One update, never rolled back.
+    expect(mockPrisma.domain.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("never touches the message log", async () => {
+    await reprovisionDomain("dom_tintin", ACS_ROW.id);
+
+    expect(mockPrisma.message.update).not.toHaveBeenCalled();
+    expect(mockPrisma.message.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.message.deleteMany).not.toHaveBeenCalled();
+    // The row keeps its id, so every Message.domainId stays valid.
+    expect(mockPrisma.domain.update.mock.calls[0][0].where).toEqual({ id: "dom_tintin" });
+  });
+
+  it("404s an unknown domain and an unknown carrier, provisioning neither", async () => {
+    mockPrisma.domain.findUnique.mockResolvedValue(null);
+    await expect(reprovisionDomain("dom_missing", ACS_ROW.id)).rejects.toMatchObject({
+      status: 404,
+      code: "not_found",
+    });
+
+    mockPrisma.domain.findUnique.mockResolvedValue(smtpDomain());
+    await expect(reprovisionDomain("dom_tintin", "car_nope")).rejects.toMatchObject({
+      status: 404,
+      code: "carrier_not_found",
+    });
+
+    expect(acsProvisioner.createDomain).not.toHaveBeenCalled();
+    expect(mockPrisma.domain.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses a disabled target carrier the way an unset default is refused", async () => {
+    carriers([SMTP_ROW, { ...ACS_ROW, enabled: false }]);
+
+    await expect(reprovisionDomain("dom_tintin", ACS_ROW.id)).rejects.toMatchObject({
+      status: 409,
+      code: "no_default_carrier",
+    });
+    expect(mockPrisma.domain.update).not.toHaveBeenCalled();
   });
 });

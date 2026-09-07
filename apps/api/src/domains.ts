@@ -245,6 +245,107 @@ export async function checkDomain(id: string): Promise<DomainWithCarrier> {
 }
 
 // ---------------------------------------------------------------------------
+// Reprovision (move an existing domain to another carrier)
+// ---------------------------------------------------------------------------
+
+/**
+ * Move `id` onto `carrierId` and register it there.
+ *
+ * The row keeps its id, so every `Message` already logged against the domain
+ * stays attached — which is the whole point: `deleteDomain` refuses a domain
+ * that has sent mail, so delete-and-recreate is not a migration path for a
+ * live domain.
+ *
+ * Order matters. The target provider is asked first and the row is left
+ * untouched if it refuses (same rule as `createDomain`: never point the
+ * dashboard at a carrier that has no identity for the domain). The old
+ * provider is only cleaned up once the new state is committed, best effort —
+ * a stale identity upstream is not worth failing or reverting a migration for.
+ */
+export async function reprovisionDomain(id: string, carrierId: string): Promise<DomainWithCarrier> {
+  const domain = await prisma.domain.findUnique({ where: { id }, include: domainWithCarrier });
+  if (!domain) throw new DomainError(404, "not_found");
+
+  // Explicit target only. `resolveCarrier` falls back to the platform default
+  // for an empty id, and a migration must never guess where it is going.
+  if (!carrierId) throw new DomainError(404, "carrier_not_found");
+  const targetRow = await resolveCarrier(carrierId);
+
+  // Already there: idempotent, and no provider is touched. Re-registering
+  // would reissue DKIM records and drop a working domain back to PENDING.
+  if (targetRow.id === domain.carrierId) return domain;
+
+  const target = carrierFor(targetRow);
+
+  let data: Prisma.DomainUncheckedUpdateInput = {
+    carrierId: targetRow.id,
+    // Manual carrier (no `domains`): nothing upstream to verify, same terms a
+    // domain created on it would get.
+    status: "VERIFIED",
+    dnsRecords: [],
+    mailFromDomain: null,
+    verifiedAt: new Date(),
+    verificationError: null,
+  };
+
+  if (target.domains) {
+    const mailFromDomain = target.domains.mailFromFor(domain.name);
+    let records: DnsRecord[];
+    try {
+      ({ records } = await target.domains.createDomain(domain.name, { mailFromDomain }));
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      logger.error(
+        { domain: domain.name, carrier: targetRow.name, err: detail },
+        "domain reprovisioning failed; carrier not moved",
+      );
+      throw new DomainError(502, "provider_error", { message: detail.slice(0, 500) });
+    }
+    data = {
+      ...data,
+      status: "PENDING",
+      dnsRecords: records as unknown as Prisma.InputJsonValue,
+      mailFromDomain,
+      verifiedAt: null,
+      // Nothing has been checked against the *new* carrier yet; keeping the old
+      // carrier's timestamp would read as "checked just now" in the dashboard.
+      lastCheckedAt: null,
+      // The 72h window starts again from this move, not from the original
+      // registration — otherwise an old domain expires on its first sweep.
+      createdAt: new Date(),
+    };
+  }
+
+  const updated = await prisma.domain.update({ where: { id }, data, include: domainWithCarrier });
+  logger.info(
+    { domain: domain.name, from: domain.carrier.name, to: targetRow.name, status: updated.status },
+    "domain reprovisioned onto a new carrier",
+  );
+
+  // Last, and never fatal: the row is already on the new carrier.
+  const previousRow = await prisma.carrier.findUnique({ where: { id: domain.carrierId } });
+  if (previousRow) {
+    const previous = carrierFor(previousRow);
+    if (previous.domains) {
+      try {
+        await previous.domains.deleteDomain(domain.name);
+      } catch (err) {
+        logger.warn(
+          {
+            domain: domain.name,
+            carrier: previousRow.name,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "old carrier identity delete failed; domain already moved",
+        );
+      }
+    }
+  }
+
+  return updated;
+}
+
+// ---------------------------------------------------------------------------
 // Delete
 // ---------------------------------------------------------------------------
 

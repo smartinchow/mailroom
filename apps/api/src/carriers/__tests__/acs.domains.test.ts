@@ -600,6 +600,19 @@ describe("SPF record value", () => {
     expect(record.note).toMatch(/DNS lookup failed/i);
   });
 
+  // NXDOMAIN is a definitive "no SPF record", not an inconclusive lookup. A
+  // subdomain that does not exist yet is the ordinary greenfield case, and
+  // warning there would fire on most new domains.
+  for (const code of ["ENOTFOUND", "ENODATA"]) {
+    it(`treats a ${code} resolver rejection as greenfield, with no note`, async () => {
+      const record = await spfRecord(async () => {
+        throw Object.assign(new Error(`queryTxt ${code}`), { code });
+      });
+      expect(record.value).toBe(STOCK_SPF);
+      expect(record.note).toBeUndefined();
+    });
+  }
+
   it("merges on checkDomain too, not just createDomain", async () => {
     const { provisioner } = fakeArm(
       [

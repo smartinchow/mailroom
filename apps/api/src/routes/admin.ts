@@ -12,6 +12,7 @@ import {
   checkDomain,
   createDomain as createDomainRecord,
   deleteDomain as deleteDomainRecord,
+  reprovisionDomain,
   toPublicDomain,
   type DomainWithCarrier,
 } from "../domains.js";
@@ -480,18 +481,52 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     const parsed = domainSchema.partial().omit({ name: true }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
     const { carrierId, ...rest } = parsed.data;
-    const domain = await prisma.domain.update({
-      where: { id },
-      data: { ...rest, ...(carrierId ? { carrierId } : {}) },
-      include: adminDomainInclude,
-    });
-    return reply.send(toAdminDomain(domain));
+    try {
+      // A bare FK write would move the domain to a carrier that has never
+      // heard of it — VERIFIED here, registered nowhere, every send failing at
+      // the provider. The dashboard's carrier select posts through this route,
+      // so a carrier change is routed to the same service the reprovision
+      // endpoint uses; only the metadata fields are written directly.
+      if (carrierId) await reprovisionDomain(id, carrierId);
+      const domain = await prisma.domain.update({
+        where: { id },
+        data: rest,
+        include: adminDomainInclude,
+      });
+      return reply.send(toAdminDomain(domain));
+    } catch (err) {
+      return sendAdminDomainError(reply, err);
+    }
   });
 
   app.post("/v1/admin/domains/:id/verify", async (req, reply) => {
     const { id } = req.params as { id: string };
     try {
       const domain = await checkDomain(id);
+      const full = await prisma.domain.findUniqueOrThrow({
+        where: { id: domain.id },
+        include: adminDomainInclude,
+      });
+      return reply.send(toAdminDomain(full));
+    } catch (err) {
+      return sendAdminDomainError(reply, err);
+    }
+  });
+
+  const reprovisionSchema = z.object({ carrierId: z.string().min(1) });
+
+  /**
+   * Move a domain onto another carrier and register it there — operator-only,
+   * so it is deliberately absent from `/v1/domains`. The row keeps its id and
+   * its message log; moving a verified domain onto a provisioning carrier
+   * drops it to PENDING and it cannot send until that carrier verifies it.
+   */
+  app.post("/v1/admin/domains/:id/reprovision", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const parsed = reprovisionSchema.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_request", details: parsed.error.flatten() });
+    try {
+      const domain = await reprovisionDomain(id, parsed.data.carrierId);
       const full = await prisma.domain.findUniqueOrThrow({
         where: { id: domain.id },
         include: adminDomainInclude,

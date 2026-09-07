@@ -219,6 +219,26 @@ Single module used by both public and admin routes and by the poller.
     required FK; do not cascade).
   - Provisioning carrier → `carrier.domains.deleteDomain` (best effort, log on failure),
     then delete the row.
+- `reprovisionDomain(id, carrierId)` — move an existing domain onto another carrier and
+  register it there. Added 2026-09-08 for the cPanel-SMTP → ACS migration; `deleteDomain`
+  refuses a domain that has already sent (`domain_in_use`), so delete-and-recreate is not a
+  migration path for a live domain.
+  - Unknown domain → 404 `not_found`; unknown carrier → 404 `carrier_not_found`; disabled
+    carrier → 409 `no_default_carrier` (same treatment an unset default gets).
+  - Target already the current carrier → returns the row unchanged, no provider call.
+  - Provisioning target: `mailFromDomain = carrier.domains.mailFromFor(name)`, then
+    `createDomain`; store records, `status = PENDING`, `verifiedAt = null`,
+    `verificationError = null`, and reset `createdAt = now()` so the 72 h window restarts
+    from the move rather than from the original registration. If the provider throws, the
+    row is left **completely untouched** (carrier included) and the call returns 502
+    `provider_error` — the same rule as create: never point the dashboard at a carrier that
+    refused.
+  - Manual target (no `domains`): `status = VERIFIED`, `verifiedAt = now()`,
+    `dnsRecords = []`, `mailFromDomain = null`.
+  - Only after the row is committed, the **old** carrier's `deleteDomain` runs best effort
+    (log on failure). A stale identity upstream never fails the migration or reverts the row.
+  - `Message` rows are never touched: the domain keeps its id, so the whole message log
+    follows it to the new carrier.
 - `toPublicDomain(row)` — the wire shape used by every endpoint:
 
 ```json
@@ -258,6 +278,19 @@ Error body shape follows existing routes: `{ "error": "<code>", ... }`.
   `notes`.
 - `POST /v1/admin/domains/:id/verify` — same as public verify.
 - `DELETE /v1/admin/domains/:id` — now also deletes the provider identity; 409 if in use.
+- `POST /v1/admin/domains/:id/reprovision` — body `{ "carrierId": "…" }` (400
+  `invalid_request` if absent). Runs `reprovisionDomain` and returns the same admin object
+  as `GET`. **Operator action, deliberately absent from the public `/v1/domains` routes** —
+  customers never choose a carrier.
+  - Operational consequence: moving a VERIFIED domain onto a provisioning carrier drops it
+    to `PENDING`, and the send gate (§6) refuses it with 403 `domain_not_verified` until the
+    new carrier verifies it. Publish the returned records promptly; the poller (§7) picks the
+    domain up within five minutes and the 72 h window runs from the move.
+  - Moving onto an SMTP carrier is instant (`VERIFIED`, no records) because there is nothing
+    to verify upstream.
+  - `PATCH /v1/admin/domains/:id` still writes `carrierId` on its own — it is a metadata
+    edit, and it does **not** provision. Use it only for a domain whose new carrier already
+    holds the identity; otherwise use reprovision.
 - `GET /v1/admin/domains` and `PATCH` return the full domain object (§3) plus `projectSlug`,
   `fallbackCarrierId`, `notes`.
 - `GET /v1/admin/carriers` returns `isDefault`. `PATCH /v1/admin/carriers/:id` accepts

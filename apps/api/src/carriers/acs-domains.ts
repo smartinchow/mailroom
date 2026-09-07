@@ -201,7 +201,15 @@ export async function planSpfRecord(
   let answers: string[][];
   try {
     answers = await resolveTxt(domain);
-  } catch {
+  } catch (err) {
+    // NXDOMAIN / no TXT records is a definitive answer, not a failure: the
+    // domain provably has no SPF record, which is the ordinary greenfield
+    // case for a subdomain that does not exist yet. Warning there would fire
+    // on most new domains and teach operators to ignore the one note that
+    // matters. Only an inconclusive lookup (SERVFAIL, timeout, refused)
+    // leaves us genuinely unable to tell, and that is what deserves a note.
+    const code = (err as { code?: string }).code;
+    if (code === "ENOTFOUND" || code === "ENODATA") return { value: stock };
     return {
       value: stock,
       note: "Could not read this domain's existing SPF record (DNS lookup failed). If one is already published, merge this include into it instead of replacing it.",

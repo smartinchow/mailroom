@@ -299,7 +299,10 @@ describe("checkDomain state machine", () => {
     expect(initiatedTypes(calls)).toEqual(["DKIM2"]);
   });
 
-  it("VerificationFailed fails the domain and surfaces the errorCode", async () => {
+  // ACS's checks are flaky enough to fail against correct DNS and pass on
+  // retry, so a failed sub-verification stays retryable and only `applyExpiry`
+  // (72h) makes it terminal.
+  it("VerificationFailed surfaces the errorCode but stays PENDING, not FAILED", async () => {
     const { provisioner } = checkWith({
       Domain: { status: "Verified" },
       SPF: { status: "VerificationFailed", errorCode: "DnsRecordNotFound" },
@@ -307,9 +310,31 @@ describe("checkDomain state machine", () => {
       DKIM2: { status: "Verified" },
     });
     const res = await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN });
-    expect(res.status).toBe("FAILED");
+    expect(res.status).toBe("PENDING");
     expect(res.error).toBe("SPF verification failed (DnsRecordNotFound)");
     expect(byPurpose(res.records, "MAIL_FROM_SPF")[0].status).toBe("FAILED");
+  });
+
+  it("re-initiates a VerificationFailed type so a stuck domain can recover", async () => {
+    const { provisioner, calls } = checkWith({
+      Domain: { status: "Verified" },
+      SPF: { status: "VerificationFailed", errorCode: "MultipleSPFRecordsFound" },
+      DKIM: { status: "Verified" },
+      DKIM2: { status: "Verified" },
+    });
+    await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN });
+    expect(initiatedTypes(calls)).toEqual(["SPF"]);
+  });
+
+  it("re-initiates a failed ownership check without touching the later types", async () => {
+    const { provisioner, calls } = checkWith({
+      Domain: { status: "VerificationFailed", errorCode: "DnsRecordNotFound" },
+      SPF: { status: "NotStarted" },
+      DKIM: { status: "NotStarted" },
+      DKIM2: { status: "NotStarted" },
+    });
+    await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN });
+    expect(initiatedTypes(calls)).toEqual(["Domain"]);
   });
 
   it("maps a 404 domain to FAILED", async () => {

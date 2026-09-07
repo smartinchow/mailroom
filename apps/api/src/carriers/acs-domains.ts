@@ -555,11 +555,21 @@ export function createAcsDomainProvisioner(
       // ACS refuses SPF/DKIM/DKIM2 verification until ownership is proven, so
       // the state machine is driven one step per poll from here. `initiate`
       // never throws: a rejected start is retried on the next sweep.
-      if (states.Domain === "NotStarted" || states.Domain === undefined) {
+      // `VerificationFailed` is retried, not treated as final. ACS's own checks
+      // are demonstrably flaky — an SPF check has been observed reporting
+      // MultipleSPFRecordsFound against a domain publishing exactly one record,
+      // then passing on retry with the DNS untouched. Without a retry the
+      // domain is stuck for good, because a FAILED domain is no longer polled
+      // and re-verifying only re-reads the same dead state. It also means a
+      // user who fixes their DNS recovers on the next sweep.
+      const needsStart = (s: AcsVerificationStatus | undefined) =>
+        s === undefined || s === "NotStarted" || s === "VerificationFailed";
+
+      if (needsStart(states.Domain)) {
         await initiate(name, "Domain");
       } else if (states.Domain === "Verified") {
         for (const key of ["SPF", "DKIM", "DKIM2"] as const) {
-          if (states[key] === "NotStarted" || states[key] === undefined) await initiate(name, key);
+          if (needsStart(states[key])) await initiate(name, key);
         }
       }
 
@@ -573,7 +583,11 @@ export function createAcsDomainProvisioner(
             return code ? `${key} verification failed (${code})` : `${key} verification failed`;
           })
           .join("; ");
-        return { status: "FAILED" as DomainStatus, records, error };
+        // PENDING, not FAILED: the retry above has just been kicked off, and
+        // `applyExpiry` still fails the domain for real once the 72h window
+        // closes. Reporting FAILED here would stop the poller from ever
+        // revisiting it, making a transient provider check permanent.
+        return { status: "PENDING" as DomainStatus, records, error };
       }
 
       if (RECORD_KEYS.every((key) => states[key] === "Verified")) {

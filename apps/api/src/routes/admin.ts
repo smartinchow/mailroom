@@ -18,7 +18,24 @@ import {
 import { sendQueue } from "../queue.js";
 
 const carrierConfigSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("acs"), connectionString: z.string().min(10), resourceId: z.string().min(10) }),
+  z.object({
+    type: z.literal("acs"),
+    connectionString: z.string().min(10),
+    resourceId: z.string().min(10),
+    // Optional: only an ACS carrier given ARM credentials can provision
+    // sending domains. Omit it and the carrier stays "manual".
+    arm: z
+      .object({
+        tenantId: z.string().min(1),
+        clientId: z.string().min(1),
+        clientSecret: z.string().min(1),
+        subscriptionId: z.string().min(1),
+        resourceGroup: z.string().min(1),
+        emailServiceName: z.string().min(1),
+        communicationServiceName: z.string().min(1),
+      })
+      .optional(),
+  }),
   z.object({
     type: z.literal("ses"),
     region: z.string().min(2),

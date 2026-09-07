@@ -1,24 +1,32 @@
-# Spec — Mailroom-managed sending domains (Resend model on Amazon SES)
+# Spec — Mailroom-managed sending domains (Resend model on Amazon SES / Azure Communication Services)
 
-Status: approved for implementation 2026-09-04. Owner: Mailroom.
+Status: approved for implementation 2026-09-04; extended to ACS provisioning 2026-09-08
+(D-15). Owner: Mailroom.
 
 ## Goal
 
 Any project can add its own sending domain to Mailroom, receive the DNS records it must
 publish, and have Mailroom verify the domain against the carrier — exactly the flow
-resend.com offers. One platform-level Amazon SES carrier (`ses-mailroom`,
-the Consultin AWS account, region `ap-southeast-2`, configuration set `mailroom`) is the
-default carrier for every new domain. ACS and SMTP carriers keep working unchanged.
+resend.com offers. Two carriers now provision domains this way: Amazon SES (`ses-mailroom`,
+the Consultin AWS account, region `ap-southeast-2`, configuration set `mailroom`) and Azure
+Communication Services (`amlify-acs`, over Azure Resource Manager). Exactly one carrier is
+flagged `isDefault` and new domains provision against it; as of D-15 that carrier is ACS.
+SMTP carriers keep working unchanged.
 
 Non-goals: Mailroom never signs DKIM or touches DNS itself (D-03). No automatic DNS
 publishing to registrars in this iteration.
 
 ## Terminology
 
-- **Provisioning carrier** — a carrier whose adapter implements `domains` (below). SES is
-  the first. ACS/SMTP do not provision; domains on them are "manual".
-- **MAIL FROM domain** — the SES custom MAIL FROM subdomain, always `send.<domain>`
-  (Resend uses the same name). Required so SPF aligns with the From domain.
+- **Provisioning carrier** — a carrier whose adapter implements `domains` (below). SES and
+  ACS (when configured with ARM credentials, `AcsArmConfig`) both provision. SMTP does not;
+  domains on it are "manual" — verified at creation, no records, no polling.
+- **MAIL FROM domain** — the domain SPF must align against. Providers disagree on the
+  convention, which is why `DomainProvisioner` carries a `mailFromFor(name)` method:
+  - **SES**: a custom MAIL FROM subdomain, always `send.<domain>` (Resend uses the same
+    name).
+  - **ACS**: no custom MAIL FROM subdomain exists. `mail_from_domain` equals the sending
+    domain itself — ACS publishes its SPF TXT directly on `<domain>`, not on a subdomain.
 
 ## 1. Data model (Prisma, new migration `20260904_domains_verification`)
 
@@ -61,16 +69,26 @@ interface DnsRecord {
   value: string;       // e.g. "abc.dkim.amazonses.com" | "feedback-smtp.ap-southeast-2.amazonses.com"
   priority?: number;   // MX only (10)
   ttl?: number;        // suggested, e.g. 300 (informational)
-  purpose: "DKIM" | "MAIL_FROM_MX" | "MAIL_FROM_SPF" | "DMARC";
+  purpose: "DKIM" | "MAIL_FROM_MX" | "MAIL_FROM_SPF" | "DMARC" | "DOMAIN_OWNERSHIP";
   required: boolean;   // DMARC is recommended, not required
   status: "PENDING" | "VERIFIED" | "FAILED" | "NOT_STARTED";
 }
 ```
 
+`DOMAIN_OWNERSHIP` is ACS-only — the ownership TXT ACS requires before it will start SPF/
+DKIM/DKIM2 verification (see the ACS implementation below). SES has no equivalent record.
+
 ## 2. Carrier contract extension (`apps/api/src/carriers/types.ts`)
 
 ```ts
 export interface DomainProvisioner {
+  /**
+   * The MAIL FROM domain this provider wants for `name`. Providers disagree
+   * (see Terminology above), so `domains.ts` asks rather than assumes —
+   * keeping the difference inside `carriers/` per the no-provider-branches
+   * rule.
+   */
+  mailFromFor(name: string): string;
   /** Register the identity with the provider. Idempotent: if it already exists, return its records. */
   createDomain(name: string, opts: { mailFromDomain: string }): Promise<{ records: DnsRecord[] }>;
   /** Ask the provider for the current verification state and per-record status. */
@@ -117,6 +135,60 @@ export interface Carrier {
   - `NotFoundException` → status FAILED, error "identity not found at provider".
 - `deleteDomain`: `DeleteEmailIdentityCommand`; swallow `NotFoundException`.
 
+### ACS implementation (`apps/api/src/carriers/acs-domains.ts`)
+
+Added under D-15, alongside the platform default carrier moving to ACS. Talks raw Azure
+Resource Manager REST (api-version `2023-04-01`) through an injectable `fetch` — ACS has no
+management-plane SDK worth a dependency here — against the existing `amlify-email` /
+`amlify-acs` resources in `rg-amlify-email`. Present only when the carrier's config
+(`AcsConfig.arm`, typed `AcsArmConfig`) carries Entra service-principal credentials; an ACS
+carrier configured without `arm` has no `domains` and stays a manual carrier exactly as
+before D-15.
+
+- `mailFromFor(name)` returns `name` unchanged — ACS has no custom MAIL FROM subdomain (see
+  Terminology above). This is the one place the SES and ACS provisioners genuinely diverge
+  in shape, which is why `mailFromFor` exists on the interface at all.
+- `createDomain`: `PUT .../domains/<name>` (upsert — an existing domain is updated in place
+  and still returns its records, satisfying the idempotency the contract requires), then
+  immediately calls `initiateVerification` for `Domain` only. Ownership is the gate on
+  everything else (below), so there is nothing else to start yet.
+- **Verification ordering — Domain before SPF/DKIM/DKIM2.** ACS reports four independent
+  verification types — `Domain` (ownership TXT), `SPF` (TXT), `DKIM` and `DKIM2` (CNAMEs) —
+  but refuses to accept an `initiateVerification` call for SPF/DKIM/DKIM2 until `Domain`
+  itself reports `Verified`. `checkDomain` therefore runs a small state machine on every
+  poll rather than a single status check: if `Domain` is not started, (re-)start it; once
+  `Domain` is `Verified`, start any of SPF/DKIM/DKIM2 that are not yet started. A rejected
+  `initiateVerification` call (wrong prerequisite, already in flight) is swallowed, not
+  fatal — the next 5-minute poll retries. `DnsRecord.purpose` maps `Domain` → the new
+  `DOMAIN_OWNERSHIP`, `SPF` → `MAIL_FROM_SPF`, `DKIM`/`DKIM2` → `DKIM` (two records, same
+  purpose). All four are `required: true`; there is no DMARC record on ACS at all (neither
+  issued nor checked).
+- ACS record names come back **relative** to the domain (e.g.
+  `selector1-azurecomm-prod-net._domainkey`, or `@`/empty for the apex) — `qualify()`
+  fully-qualifies them before they go on `DnsRecord.name`, which is documented FQDN-only.
+- `checkDomain` status mapping: any record `VerificationFailed` → domain `FAILED` (error
+  lists which record and ACS's error code); all four `Verified` → domain `VERIFIED`;
+  otherwise `PENDING`. An ARM call that fails with 429 or 5xx maps to `TEMPORARY_FAILURE`
+  (never treated as a record the customer got wrong); ARM 404 on the domain resource maps to
+  `FAILED` with "domain not found at provider".
+- **Two side effects only run once every record is `Verified`**, both idempotent so
+  repeating them on a later check of an already-verified domain is harmless:
+  1. `ensureSenderUsernames` — `PUT` (upsert) `noreply` and `donotreply` sender usernames on
+     the domain. ACS refuses to send from a username that isn't registered, so this is part
+     of making a freshly verified domain actually usable, not an afterthought.
+  2. `link(name)` — add the domain's ARM resource id to the Communication Service's
+     `linkedDomains`. **This is a read-modify-write, not a plain write.** The ARM PATCH
+     replaces the entire `linkedDomains` array; the implementation always `GET`s the current
+     array first and appends, because a blind write would unlink every other live sending
+     domain already on `amlify-acs`. `deleteDomain` mirrors this with `unlink`, which reads
+     the array and filters out only its own entry.
+- `deleteDomain`: unlinks first (ARM refuses to delete a domain still linked to the
+  Communication Service), then `DELETE`s the domain resource. Both steps swallow 404 —
+  "already gone" is success, per the contract.
+- Long-running ARM operations (the domain PUT, `initiateVerification`, sender-username PUT,
+  the DELETE) are followed via the `Azure-AsyncOperation` header, bounded to 20 attempts at
+  1.5s apiece so a stuck ARM operation is left to the next poll rather than wedging a worker.
+
 ## 3. Domain service (`apps/api/src/domains.ts`, new)
 
 Single module used by both public and admin routes and by the poller.
@@ -127,9 +199,10 @@ Single module used by both public and admin routes and by the poller.
   - Resolve carrier: explicit `carrierId` (admin only) else the default carrier
     (`isDefault = true`, `enabled = true`); none → 409 `no_default_carrier`.
   - `name` already exists → 409 `domain_exists` (unique constraint; catch P2002).
-  - Provisioning carrier: `mailFromDomain = "send." + name`; call `carrier.domains.createDomain`;
-    store records, `status = PENDING`. If the provider call throws, do **not** create the row;
-    return 502 `provider_error` with the provider message.
+  - Provisioning carrier: `mailFromDomain = carrier.domains.mailFromFor(name)` (`send.<name>`
+    on SES; `name` itself on ACS — never hardcoded in `domains.ts`); call
+    `carrier.domains.createDomain`; store records, `status = PENDING`. If the provider call
+    throws, do **not** create the row; return 502 `provider_error` with the provider message.
   - Manual carrier (no `domains`): `status = VERIFIED`, `verifiedAt = now()`, `dnsRecords = []`,
     `mailFromDomain = null`.
 - `checkDomain(id)`:
@@ -180,8 +253,9 @@ Error body shape follows existing routes: `{ "error": "<code>", ... }`.
 ## 5. Admin API additions (`apps/api/src/routes/admin.ts`)
 
 - `POST /v1/admin/domains` — body gains optional `carrierId` (defaults to default carrier),
-  `projectId` (nullable = shared). Runs the same `createDomain` (provisions on SES). Keep
-  `fallbackCarrierId`, `notes`.
+  `projectId` (nullable = shared). Runs the same `createDomain` (provisions on whichever
+  carrier is resolved — SES or ACS; a no-op to VERIFIED on SMTP). Keep `fallbackCarrierId`,
+  `notes`.
 - `POST /v1/admin/domains/:id/verify` — same as public verify.
 - `DELETE /v1/admin/domains/:id` — now also deletes the provider identity; 409 if in use.
 - `GET /v1/admin/domains` and `PATCH` return the full domain object (§3) plus `projectSlug`,
@@ -217,6 +291,12 @@ if (domain.status !== "VERIFIED") {
 2. E2E: add `mail.amlify.au` for project `amlify`, publish the returned records on the
    amlify.au Cloudflare zone, poll verify, send a test message, confirm SNS `Delivery` event
    flows to `DELIVERED`.
+
+Superseded by D-15: the default carrier is now `amlify-acs`, not `ses-mailroom`
+(`PATCH /v1/admin/carriers/<amlify-acs id> { "isDefault": true }`). The E2E in step 2 is the
+same shape against ACS: publish the four ACS records (merging the SPF include per the SPF
+merge hazard in `CLAUDE.md` if the domain already sends mail elsewhere), poll verify, send a
+test message, confirm the Event Grid `Delivered` event flows through.
 
 ## 9. Dashboard (`apps/web`)
 
@@ -265,6 +345,12 @@ snake_case wire shape the same way emails are). Tests mock `fetch` like the exis
 - Route tests for `/v1/domains` create/list/verify/delete with a mocked prisma + fake carrier
   (follow `routes/__tests__/messengers.test.ts` for the app/prisma mocking pattern).
 - Send gate: unverified domain → 403 `domain_not_verified`.
+
+Added under D-15: `carriers/__tests__/acs.domains.test.ts` covering `qualify()`,
+`buildRecords()`, the Domain-before-SPF/DKIM/DKIM2 ordering, the `linkedDomains`
+read-modify-write (link and unlink each preserve unrelated entries), and the
+TEMPORARY_FAILURE mapping for 429/5xx ARM responses — with `fetch`, `sleep` and `now` all
+injected per `AcsDomainProvisionerDeps`, no live ARM call.
 
 ## 12. Docs to update
 

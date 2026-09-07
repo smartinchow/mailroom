@@ -81,8 +81,9 @@ can be rotated without downtime.
 (PENDING|VERIFIED|FAILED|TEMPORARY_FAILURE), dnsRecords (DnsRecord[] json), mailFromDomain?,
 verifiedAt?, lastCheckedAt?, verificationError?, notes, createdAt`
 `projectId = null` means the domain is shared across projects. `status` gates sending
-(D-07 extension, §9); carriers whose adapter implements `domains` (SES) provision and issue
-`dnsRecords` to publish, others (ACS, SMTP) are "manual" and land `VERIFIED` at creation.
+(D-07 extension, §9); carriers whose adapter implements `domains` (SES, and ACS when
+configured with ARM credentials, D-15) provision and issue `dnsRecords` to publish; SMTP has
+no provisioner and is "manual" — it lands `VERIFIED` at creation.
 
 **Carrier** gains `isDefault` — exactly one carrier may be the default new domains
 provision against; enforced in code, not the database.
@@ -233,31 +234,42 @@ rather than implying delivery. Used for Mailpit in development, and as an escape
 ## 9. Domain verification
 
 Mailroom provisions and verifies sending domains itself, Resend-style, on top of whichever
-carrier is marked default (§5) — the platform Amazon SES carrier out of the box. Mailroom
-still never signs DKIM or touches DNS (D-03, D-14); it only asks the carrier to create the
-identity and reports back the records a human must publish.
+carrier is marked default (§5) — the platform ACS carrier out of the box (D-15; SES was the
+default under D-14 and remains a fully supported provisioning carrier for any domain an
+admin assigns to it explicitly). Mailroom still never signs DKIM or touches DNS (D-03,
+D-14); it only asks the carrier to create the identity and reports back the records a human
+must publish.
 
 Flow:
 
 1. **Create.** `POST /v1/domains { "name" }` resolves the project's default carrier, asks
    its `DomainProvisioner.createDomain()` for the identity, and stores the returned
-   `DnsRecord[]` with `status = PENDING`. A carrier without a `domains` provisioner (ACS,
-   SMTP) is "manual": the domain is marked `VERIFIED` immediately, no records issued —
-   these carriers keep working exactly as before.
+   `DnsRecord[]` with `status = PENDING`. `mailFromDomain` is whatever the carrier's
+   `mailFromFor(name)` says — `send.<name>` on SES, `name` itself on ACS, since ACS has no
+   custom MAIL FROM subdomain. A carrier without a `domains` provisioner (SMTP only) is
+   "manual": the domain is marked `VERIFIED` immediately, no records issued — SMTP keeps
+   working exactly as before.
 2. **Records.** Each record carries `type`, `name`, `value`, an optional `priority`/`ttl`,
-   a `purpose` (`DKIM | MAIL_FROM_MX | MAIL_FROM_SPF | DMARC`), whether it's `required`,
-   and its own per-record `status`. The dashboard renders these as a copyable table; DMARC
-   is recommended, not required, to keep the happy path to "3 CNAMEs + 1 MX + 1 TXT".
+   a `purpose` (`DKIM | MAIL_FROM_MX | MAIL_FROM_SPF | DMARC | DOMAIN_OWNERSHIP`), whether
+   it's `required`, and its own per-record `status`. `DOMAIN_OWNERSHIP` is ACS-only (its
+   ownership TXT); SES has no equivalent. The dashboard renders these as a copyable table;
+   DMARC is recommended, not required (and ACS never issues or checks it at all).
 3. **Poll.** A repeatable BullMQ job re-checks every `PENDING`/`TEMPORARY_FAILURE` domain
    on a provisioning carrier every 5 minutes via `checkDomain()`, sequentially per carrier
-   to respect provider rate limits. `POST /v1/domains/:id/verify` runs the same check
-   on demand. A domain stuck unverified for 72h flips to `FAILED`; re-running `verify`
-   resets the window and restarts checking, matching Resend's UX.
+   to respect provider rate limits. On ACS, `checkDomain` also drives verification
+   ordering — ACS will not start `SPF`/`DKIM`/`DKIM2` until `Domain` (ownership) reports
+   Verified, so each poll advances whichever step is next. `POST /v1/domains/:id/verify`
+   runs the same check on demand. A domain stuck unverified for 72h flips to `FAILED`;
+   re-running `verify` resets the window and restarts checking, matching Resend's UX.
 4. **Gate.** `status !== VERIFIED` blocks sending from that domain (D-07 extension): the
    send route returns `403 domain_not_verified` before it ever reaches a carrier, so an
    unverified domain cannot leak a partially-configured send.
-5. **Manual carriers.** ACS and SMTP domains carry no records and no polling — they are
-   `VERIFIED` at creation and behave exactly as they did before this feature existed.
+5. **Manual carrier.** SMTP domains carry no records and no polling — they are `VERIFIED`
+   at creation and behave exactly as they did before this feature existed.
+6. **ACS linking.** Once every ACS record verifies, `checkDomain` also registers the
+   `noreply`/`donotreply` sender usernames and adds the domain to the Communication
+   Service's `linkedDomains` — a read-modify-write, since the ARM PATCH replaces the whole
+   array and a blind write would unlink every other live sending domain on the resource.
 
 ## 10. Content retention — security-critical
 

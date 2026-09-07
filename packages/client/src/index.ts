@@ -71,8 +71,13 @@ export interface ListEmailsResult {
 /** Lower-cased on the wire: `pending | verified | failed | temporary_failure`. */
 export type DomainStatus = "pending" | "verified" | "failed" | "temporary_failure";
 
-/** Lower-cased on the wire: `dkim | mail_from_mx | mail_from_spf | dmarc`. */
-export type DnsRecordPurpose = "dkim" | "mail_from_mx" | "mail_from_spf" | "dmarc";
+/** Lower-cased on the wire. `domain_ownership` is the ACS domain-verification TXT. */
+export type DnsRecordPurpose =
+  | "dkim"
+  | "mail_from_mx"
+  | "mail_from_spf"
+  | "dmarc"
+  | "domain_ownership";
 
 /** One DNS record to publish for domain verification. */
 export interface DnsRecord {
@@ -84,6 +89,8 @@ export interface DnsRecord {
   purpose: DnsRecordPurpose;
   required: boolean;
   status: "pending" | "verified" | "failed" | "not_started";
+  /** Set only when the carrier rewrote the value (e.g. an SPF record merged with one already published). */
+  note?: string | null;
 }
 
 /** A sending domain: created via `domains.create`, verified via `domains.verify`. */

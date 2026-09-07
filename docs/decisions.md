@@ -168,3 +168,65 @@ would add credential scope for every registrar a customer happens to use, for a 
 Cloudflare/Route53/etc. already do safely). DKIM signing and SPF alignment remain entirely
 the carrier's job (D-03 intact) — Mailroom only relays the tokens SES issues and checks
 whether they resolved.
+
+> Superseded as of D-15: the default carrier is now ACS, not SES. The mechanism described
+> above — one platform carrier flagged `isDefault`, new domains provision against it — is
+> unchanged; only which carrier holds the flag changed.
+
+## D-15 — Platform default carrier moves to ACS; ACS now provisions and verifies domains too
+
+**Decided: ACS becomes the platform default carrier, superseding D-14's choice of SES.**
+The `DomainProvisioner` contract that SES implemented under D-14 is now also implemented by
+ACS, over Azure Resource Manager (`apps/api/src/carriers/acs-domains.ts`). D-14's mechanism
+— exactly one carrier flagged `isDefault`, new domains provision against it — is retained
+unchanged; only the carrier wearing the flag changes. SES stays a fully supported
+provisioning carrier for any domain an admin explicitly assigns to it.
+
+Reason is the same one D-02 already put on record: available Azure credit. That was true
+when D-02 made ACS the primary carrier for sending; it is equally true now that provisioning
+is the thing being decided. Restated plainly so it isn't rediscovered as a surprise a second
+time: **the cost comparison still favours SES** (D-02's numbers are unchanged — ACS runs
+roughly 2.5× SES per email). This is a commercial call, not a technical one.
+
+What made it practical rather than just desirable is that ACS domain provisioning reuses
+the existing `amlify-*` resources (Email Communication Service `amlify-email`, Communication
+Service `amlify-acs`, resource group `rg-amlify-email`, `dataLocation: australia`) rather
+than standing up
+anything new. The resource name never reaches a customer — the DKIM CNAME a domain owner
+publishes points at `azurecomm.net` and the SPF TXT at `spf.protection.outlook.com`,
+regardless of which ACS resource issued them — and a second ACS resource would not raise
+throughput, because the ~100/hour quota is per subscription, not per resource. Auth is an
+Entra service principal using client-credentials against `https://management.azure.com/.default`,
+scoped Contributor on the two individual resources rather than the resource group; the
+credentials live in the operator's keys file and in the AES-encrypted carrier config
+(`AcsArmConfig`), never in the repo.
+
+Two mechanical differences from SES that the implementation had to account for, both now
+part of the carrier contract rather than a leak into `domains.ts`:
+
+- ACS has **no custom MAIL FROM subdomain** — its SPF TXT sits on the sending domain itself.
+  `DomainProvisioner` grew a required `mailFromFor(name)` method so each carrier states its
+  own convention (SES: `send.<name>`; ACS: `name` unchanged) instead of `domains.ts`
+  special-casing a provider.
+- ACS verifies in four parts — `Domain` (ownership TXT), `SPF`, `DKIM`, `DKIM2` — and refuses
+  to start SPF/DKIM/DKIM2 until `Domain` reports Verified. `checkDomain` therefore drives an
+  ordered state machine across polls rather than a single status check. `DnsRecord.purpose`
+  gained `DOMAIN_OWNERSHIP` to carry the new record type on the wire.
+
+Left open, not solved by this decision: making ACS the default for every project needs an
+Azure support ticket to raise the ~100/hour quota, which is shared across the subscription
+with Listmonk (a 95/hour window observed live) and leaves Mailroom's own carrier capped at
+30/hour until that ticket lands. Treat this as an operational risk to track, not a blocker
+already cleared.
+
+**Rejected:**
+- **A separate, neutral ACS resource instead of reusing `amlify-*`.** Cleaner-looking
+  ownership, but no customer-visible upside (the resource name is invisible in the DNS
+  records a domain owner publishes) and a real downside (a second resource does not raise
+  the per-subscription quota, so it would only add an ARM credential set and a resource to
+  operate for no gain).
+- **Keeping ACS "manual" and leaving SES as the sole provisioning default.** Would satisfy
+  the commercial motive (send more through the credit) without touching provisioning, but it
+  leaves every new domain provisioning against a carrier (SES) that isn't the one actually
+  carrying the traffic — the split D-14 was written to avoid — and defers the ARM
+  integration work rather than doing it once, correctly, now.

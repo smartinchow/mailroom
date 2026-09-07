@@ -392,6 +392,11 @@ function createSesDomainProvisioner(
   resolveTxt: (hostname: string) => Promise<string[][]>,
 ): DomainProvisioner {
   return {
+    // SES needs a custom MAIL FROM subdomain so SPF aligns with the From domain.
+    mailFromFor(name) {
+      return `send.${name}`;
+    },
+
     async createDomain(name, opts) {
       let tokens: string[] = [];
       try {

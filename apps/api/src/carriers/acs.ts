@@ -1,6 +1,7 @@
 import { EmailClient } from "@azure/communication-email";
 import { bareAddress } from "../address.js";
 import { safeEqual } from "../crypto.js";
+import { createAcsDomainProvisioner } from "./acs-domains.js";
 import type {
   AcsConfig,
   Carrier,
@@ -36,6 +37,11 @@ export function createAcsCarrier(config: AcsConfig): Carrier {
 
   return {
     type: "acs",
+
+    // Provisioning needs ARM credentials the connection string does not carry.
+    // Without them the carrier stays "manual": domains land VERIFIED at
+    // creation, exactly as before this capability existed.
+    domains: config.arm ? createAcsDomainProvisioner(config.arm) : undefined,
 
     async send(msg: OutboundMessage) {
       // ACS senderAddress must be a bare address; the display name comes from

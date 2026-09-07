@@ -61,21 +61,46 @@ export interface DnsRecord {
   priority?: number;
   /** Suggested TTL, informational. */
   ttl?: number;
-  purpose: "DKIM" | "MAIL_FROM_MX" | "MAIL_FROM_SPF" | "DMARC";
+  /** DOMAIN_OWNERSHIP is the ACS domain-verification TXT; SES has no equivalent. */
+  purpose: "DKIM" | "MAIL_FROM_MX" | "MAIL_FROM_SPF" | "DMARC" | "DOMAIN_OWNERSHIP";
   /** DMARC is recommended, not required. */
   required: boolean;
   status: "PENDING" | "VERIFIED" | "FAILED" | "NOT_STARTED";
+  /**
+   * Operator-facing explanation, set only when the carrier rewrote the value it
+   * would otherwise have handed back (ACS merging its include into an SPF
+   * record the domain already publishes). Free text; nothing branches on it.
+   */
+  note?: string;
 }
 
 /**
  * Optional carrier capability: registering and verifying a sending identity
- * with the provider. SES implements it; ACS and SMTP do not — domains on
- * those carriers are "manual" and go straight to VERIFIED.
+ * with the provider. SES and ACS (when given ARM credentials) implement it;
+ * SMTP does not — domains on it are "manual" and go straight to VERIFIED.
  */
 export interface DomainProvisioner {
+  /**
+   * The MAIL FROM domain this provider wants for `name`. Providers disagree:
+   * SES needs a custom MAIL FROM subdomain (`send.<name>`) so SPF aligns with
+   * the From domain, while ACS has no custom MAIL FROM at all and publishes
+   * its SPF TXT on the sending domain itself. Asking the provisioner keeps
+   * that difference inside `carriers/` (CLAUDE.md) instead of in `domains.ts`.
+   */
+  mailFromFor(name: string): string;
   /** Register the identity with the provider. Idempotent: if it already exists, return its records. */
   createDomain(name: string, opts: { mailFromDomain: string }): Promise<{ records: DnsRecord[] }>;
-  /** Ask the provider for the current verification state and per-record status. */
+  /**
+   * Ask the provider for the current verification state and per-record status.
+   *
+   * Not read-only: a provisioner may also perform idempotent activation work
+   * here, because the 5-minute poller is the only thing that ever notices a
+   * domain has become verified. ACS uses it to drive verification forward one
+   * step per sweep (it refuses SPF/DKIM until ownership is proven) and, once
+   * all records pass, to register sender usernames and add the domain to the
+   * Communication Service's `linkedDomains` — without which it cannot send.
+   * Every such side effect must be safe to repeat on every sweep.
+   */
   checkDomain(
     name: string,
     opts: { mailFromDomain: string },
@@ -108,12 +133,33 @@ export interface Carrier {
   accountQuota?(): Promise<CarrierAccountQuota>;
 }
 
+/**
+ * Azure Resource Manager credentials + resource coordinates, needed only to
+ * provision sending domains. Sending and event ingest use the connection
+ * string alone, so this block is optional: an ACS carrier configured before
+ * domain provisioning existed keeps working as a "manual" carrier.
+ */
+export interface AcsArmConfig {
+  /** Entra tenant of the service principal. */
+  tenantId: string;
+  clientId: string;
+  clientSecret: string;
+  subscriptionId: string;
+  resourceGroup: string;
+  /** Email Communication Service resource that owns the domains. */
+  emailServiceName: string;
+  /** Communication Service resource the verified domain is linked to. */
+  communicationServiceName: string;
+}
+
 /** Decrypted per-carrier configuration shapes (stored AES-256-GCM in Carrier.configEnc). */
 export interface AcsConfig {
   type: "acs";
   connectionString: string;
   /** ACS resource id, asserted against Event Grid `topic` on ingest. */
   resourceId: string;
+  /** Present only on carriers allowed to provision domains via ARM. */
+  arm?: AcsArmConfig;
 }
 
 export interface SesConfig {

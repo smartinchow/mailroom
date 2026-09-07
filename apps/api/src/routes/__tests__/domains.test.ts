@@ -95,6 +95,7 @@ const mockPrisma = {
 };
 
 const provisioner: DomainProvisioner = {
+  mailFromFor: (name: string) => `send.${name}`,
   createDomain: vi.fn(async () => ({ records: RECORDS as never })),
   checkDomain: vi.fn(async () => ({ status: "VERIFIED" as const, records: RECORDS as never })),
   deleteDomain: vi.fn(async () => undefined),

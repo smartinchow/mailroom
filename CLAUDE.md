@@ -38,9 +38,25 @@ toward delivering mail directly is out of scope (D-03).
   string; parse it explicitly.
 - **SES identities are region-bound**; the custom MAIL FROM subdomain is always
   `send.<domain>` so SPF aligns with the From domain.
-- **`Domain.status` must be `VERIFIED` to send** (D-07 extension) — ACS/SMTP domains are
-  "manual" and land `VERIFIED` at creation; only SES provisions and polls.
+- **`Domain.status` must be `VERIFIED` to send** (D-07 extension) — only SMTP domains are
+  "manual" and land `VERIFIED` at creation; SES and ACS both provision and poll (D-15).
 - **Exactly one `Carrier.isDefault`** — new domains provision against it; enforce in code.
+  As of D-15 the default is ACS, not SES.
+- **ACS has no custom MAIL FROM subdomain** — its SPF TXT sits on the sending domain itself,
+  so `mailFromFor(name)` returns `name` unchanged (SES's `send.<domain>` is SES-only).
+- **ACS verifies `Domain` before it will even start `SPF`/`DKIM`/`DKIM2`** — the ownership
+  TXT must report `Verified` first; the poller (`checkDomain`) drives this as an ordered
+  state machine, not a single status check.
+- **`linkedDomains` on the ACS Communication Service is a whole-array PATCH replace** —
+  always read-modify-write (GET, append/filter, PATCH). A blind write unlinks every other
+  live sending domain on the resource.
+- **SPF merge hazard**: ACS issues `v=spf1 include:spf.protection.outlook.com -all`. A
+  domain may hold only one SPF TXT record, so publishing that verbatim on a domain that
+  already sends mail elsewhere replaces and hard-fails its existing senders. The ACS
+  provisioner resolves the domain's published TXT records and merges instead (`mergeSpf` in
+  `carriers/acs-domains.ts`): the include goes in front of the existing `all`, whose
+  qualifier is preserved, and `DnsRecord.note` tells the operator the record was rewritten.
+  Falls back to the stock value on a resolver failure or a duplicate-SPF PermError.
 
 ## Non-negotiables
 

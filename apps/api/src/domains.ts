@@ -91,6 +91,7 @@ export function toPublicDomain(d: DomainWithCarrier) {
       purpose: String(r.purpose).toLowerCase(),
       required: r.required,
       status: String(r.status).toLowerCase(),
+      note: r.note ?? null,
     })),
     verified_at: d.verifiedAt,
     last_checked_at: d.lastCheckedAt,
@@ -158,8 +159,9 @@ export async function createDomain(input: CreateDomainInput): Promise<DomainWith
   };
 
   if (carrier.domains) {
-    // MAIL FROM is always `send.<domain>`, so SPF aligns with the From domain.
-    const mailFromDomain = `send.${name}`;
+    // The provider decides its own MAIL FROM domain (SES wants `send.<domain>`,
+    // ACS the domain itself) — this file never learns which carrier it has.
+    const mailFromDomain = carrier.domains.mailFromFor(name);
     let records: DnsRecord[];
     try {
       ({ records } = await carrier.domains.createDomain(name, { mailFromDomain }));
@@ -223,7 +225,7 @@ export async function checkDomain(id: string): Promise<DomainWithCarrier> {
   // recovers after publishing the records late, matching Resend.
   const restarted = domain.status === "FAILED";
   const createdAt = restarted ? new Date() : domain.createdAt;
-  const mailFromDomain = domain.mailFromDomain ?? `send.${domain.name}`;
+  const mailFromDomain = domain.mailFromDomain ?? carrier.domains.mailFromFor(domain.name);
 
   const result = await carrier.domains.checkDomain(domain.name, { mailFromDomain });
   const { status, error } = applyExpiry(result.status, createdAt, result.error ?? null);

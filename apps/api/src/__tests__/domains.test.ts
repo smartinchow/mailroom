@@ -172,6 +172,7 @@ describe("toPublicDomain", () => {
           purpose: "dkim",
           required: true,
           status: "pending",
+          note: null,
         },
         {
           type: "MX",
@@ -182,6 +183,7 @@ describe("toPublicDomain", () => {
           purpose: "mail_from_mx",
           required: true,
           status: "verified",
+          note: null,
         },
       ],
       verified_at: null,
@@ -240,7 +242,9 @@ describe("verifyPendingDomains", () => {
       .fn()
       .mockRejectedValueOnce(new Error("provider unreachable"))
       .mockResolvedValueOnce({ status: "VERIFIED", records: [] });
-    mockCarrierFor.mockReturnValue({ domains: { checkDomain } });
+    mockCarrierFor.mockReturnValue({
+      domains: { checkDomain, mailFromFor: (name: string) => `send.${name}` },
+    });
     mockPrisma.domain.update.mockResolvedValue({ ...domainB, status: "VERIFIED" });
 
     const result = await verifyPendingDomains();

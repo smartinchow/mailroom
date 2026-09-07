@@ -157,7 +157,13 @@ export interface CarrierQuota {
 export type DomainStatus = "pending" | "verified" | "failed" | "temporary_failure";
 
 export type DnsRecordType = "CNAME" | "MX" | "TXT";
-export type DnsRecordPurpose = "dkim" | "mail_from_mx" | "mail_from_spf" | "dmarc";
+export type DnsRecordPurpose =
+  | "dkim"
+  | "mail_from_mx"
+  | "mail_from_spf"
+  | "dmarc"
+  /** ACS domain-verification TXT; SES has no equivalent. */
+  | "domain_ownership";
 export type DnsRecordStatus = "pending" | "verified" | "failed" | "not_started";
 
 export interface DnsRecord {
@@ -169,6 +175,8 @@ export interface DnsRecord {
   purpose: DnsRecordPurpose;
   required: boolean;
   status: DnsRecordStatus;
+  /** Set only when the carrier rewrote the value (e.g. an SPF record merged with one already published). */
+  note?: string | null;
 }
 
 /**

@@ -558,13 +558,16 @@ async function spfRecord(resolveTxt: (h: string) => Promise<string[][]>) {
 }
 
 describe("mergeSpf", () => {
-  it("preserves the existing all qualifier — a soft fail is never upgraded to a hard fail", () => {
-    expect(mergeSpf("v=spf1 a ~all")).toBe(`v=spf1 a ${INCLUDE} ~all`);
+  // Measured against ACS, not assumed: two domains identical but for the
+  // qualifier, the `-all` one verified and the `~all` one came back
+  // DnsRecordsNotMatched. A merged record keeping `~all` never verifies, so
+  // the domain never becomes sendable — the hard fail is mandatory here.
+  it("forces -all, whatever the existing qualifier was", () => {
+    expect(mergeSpf("v=spf1 a ~all")).toBe(`v=spf1 a ${INCLUDE} -all`);
     expect(mergeSpf("v=spf1 a -all")).toBe(`v=spf1 a ${INCLUDE} -all`);
-    expect(mergeSpf("v=spf1 a ?all")).toBe(`v=spf1 a ${INCLUDE} ?all`);
-    expect(mergeSpf("v=spf1 a +all")).toBe(`v=spf1 a ${INCLUDE} +all`);
-    // A bare `all` is an implicit `+all` and must stay bare.
-    expect(mergeSpf("v=spf1 a all")).toBe(`v=spf1 a ${INCLUDE} all`);
+    expect(mergeSpf("v=spf1 a ?all")).toBe(`v=spf1 a ${INCLUDE} -all`);
+    expect(mergeSpf("v=spf1 a +all")).toBe(`v=spf1 a ${INCLUDE} -all`);
+    expect(mergeSpf("v=spf1 a all")).toBe(`v=spf1 a ${INCLUDE} -all`);
   });
 
   it("inserts immediately before the all mechanism, keeping every other term in order", () => {
@@ -573,37 +576,37 @@ describe("mergeSpf", () => {
     );
   });
 
-  it("appends when the record has no all mechanism at all", () => {
-    expect(mergeSpf("v=spf1 a mx")).toBe(`v=spf1 a mx ${INCLUDE}`);
-    expect(mergeSpf("v=spf1")).toBe(`v=spf1 ${INCLUDE}`);
+  it("appends the include and a terminating -all when the record has no all", () => {
+    expect(mergeSpf("v=spf1 a mx")).toBe(`v=spf1 a mx ${INCLUDE} -all`);
+    expect(mergeSpf("v=spf1")).toBe(`v=spf1 ${INCLUDE} -all`);
   });
 
   it("appends rather than corrupting a redirect= record", () => {
     expect(mergeSpf("v=spf1 redirect=_spf.example.com")).toBe(
-      `v=spf1 redirect=_spf.example.com ${INCLUDE}`,
+      `v=spf1 redirect=_spf.example.com ${INCLUDE} -all`,
     );
   });
 
-  it("returns a record that already contains the include untouched", () => {
+  it("leaves a record alone only when it has the include AND a hard fail", () => {
     expect(mergeSpf(STOCK_SPF)).toBe(STOCK_SPF);
-    // An explicit `+` qualifier is the same mechanism, and shouting is legal.
-    expect(mergeSpf("v=spf1 a +include:spf.protection.outlook.com ~all")).toBe(
-      "v=spf1 a +include:spf.protection.outlook.com ~all",
-    );
     expect(mergeSpf("v=spf1 INCLUDE:SPF.PROTECTION.OUTLOOK.COM -all")).toBe(
       "v=spf1 INCLUDE:SPF.PROTECTION.OUTLOOK.COM -all",
+    );
+    // Include present but a soft fail: ACS still rejects it, so harden it.
+    expect(mergeSpf("v=spf1 a +include:spf.protection.outlook.com ~all")).toBe(
+      "v=spf1 a +include:spf.protection.outlook.com -all",
     );
   });
 
   it("merges the real tintinpos.com record", () => {
     expect(mergeSpf(TINTINPOS)).toBe(
-      `v=spf1 +mx +a +ip4:51.161.174.248 +include:relay.mailchannels.net ${INCLUDE} ~all`,
+      `v=spf1 +mx +a +ip4:51.161.174.248 +include:relay.mailchannels.net ${INCLUDE} -all`,
     );
   });
 
   it("merges the real maro.com.au record", () => {
     expect(mergeSpf(MARO)).toBe(
-      `v=spf1 a mx ip4:51.161.174.248 ip4:68.168.220.58 include:_spf.google.com include:spf.antispamcloud.com include:relay.mailchannels.net ${INCLUDE} ~all`,
+      `v=spf1 a mx ip4:51.161.174.248 ip4:68.168.220.58 include:_spf.google.com include:spf.antispamcloud.com include:relay.mailchannels.net ${INCLUDE} -all`,
     );
   });
 });
@@ -621,8 +624,11 @@ describe("SPF record value", () => {
       ["v=spf1 a ~all"],
       ["v=DMARC1; p=none;"],
     ]);
-    expect(record.value).toBe(`v=spf1 a ${INCLUDE} ~all`);
-    expect(record.note).toMatch(/replace that record/i);
+    expect(record.value).toBe(`v=spf1 a ${INCLUDE} -all`);
+    expect(record.note).toMatch(/replace the existing record/i);
+    // The qualifier changed, so the note must say what that costs.
+    expect(record.note).toMatch(/-all/);
+    expect(record.note).toMatch(/rejected outright/i);
   });
 
   it("joins a 255-char-split record with no separator before merging", async () => {
@@ -632,15 +638,22 @@ describe("SPF record value", () => {
     const tail = "de:spf.antispamcloud.com ~all";
     const record = await spfRecord(async () => [[head, tail]]);
     expect(record.value).toBe(
-      `v=spf1 ip4:51.161.174.248 include:_spf.google.com include:spf.antispamcloud.com ${INCLUDE} ~all`,
+      `v=spf1 ip4:51.161.174.248 include:_spf.google.com include:spf.antispamcloud.com ${INCLUDE} -all`,
     );
   });
 
   it("returns an already-satisfied record verbatim and does not ask for a change", async () => {
-    const existing = "v=spf1 a include:spf.protection.outlook.com ~all";
+    const existing = "v=spf1 a include:spf.protection.outlook.com -all";
     const record = await spfRecord(async () => [[existing]]);
     expect(record.value).toBe(existing);
     expect(record.note).toMatch(/already authorises/i);
+  });
+
+  // Include present but a soft fail: ACS rejects that, so it is not satisfied.
+  it("hardens an included-but-soft record and warns, rather than calling it done", async () => {
+    const record = await spfRecord(async () => [["v=spf1 a include:spf.protection.outlook.com ~all"]]);
+    expect(record.value).toBe("v=spf1 a include:spf.protection.outlook.com -all");
+    expect(record.note).toMatch(/rejected outright/i);
   });
 
   it("falls back to the stock record when the domain has two v=spf1 records", async () => {
@@ -682,7 +695,7 @@ describe("SPF record value", () => {
     );
     const res = await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN });
     expect(byPurpose(res.records, "MAIL_FROM_SPF")[0].value).toBe(
-      `v=spf1 +mx +a +ip4:51.161.174.248 +include:relay.mailchannels.net ${INCLUDE} ~all`,
+      `v=spf1 +mx +a +ip4:51.161.174.248 +include:relay.mailchannels.net ${INCLUDE} -all`,
     );
   });
 

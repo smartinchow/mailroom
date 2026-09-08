@@ -54,9 +54,17 @@ toward delivering mail directly is out of scope (D-03).
   domain may hold only one SPF TXT record, so publishing that verbatim on a domain that
   already sends mail elsewhere replaces and hard-fails its existing senders. The ACS
   provisioner resolves the domain's published TXT records and merges instead (`mergeSpf` in
-  `carriers/acs-domains.ts`): the include goes in front of the existing `all`, whose
-  qualifier is preserved, and `DnsRecord.note` tells the operator the record was rewritten.
-  Falls back to the stock value on a resolver failure or a duplicate-SPF PermError.
+  `carriers/acs-domains.ts`): the include goes in front of the existing `all`, and
+  `DnsRecord.note` tells the operator the record was rewritten. Falls back to the stock
+  value on a resolver failure or a duplicate-SPF PermError.
+- **ACS only verifies SPF against `-all`** — measured, not assumed: two domains identical
+  but for the qualifier, the `-all` one verified and the `~all` one returned
+  `DnsRecordsNotMatched`. Extra mechanisms are fine, a soft fail is not, so `mergeSpf`
+  forces `-all`. Consequence worth stating to a domain owner before they publish: every
+  legitimate sender must appear in the record, because under `-all` one that is missing is
+  rejected outright rather than merely marked suspicious.
+- **ACS refuses to link a domain whose SPF has not verified** — the `linkedDomains` PATCH
+  fails with `RemoteResourcePatchFailed`, so ownership + DKIM alone are not enough to send.
 
 ## Non-negotiables
 

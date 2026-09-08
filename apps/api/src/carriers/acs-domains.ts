@@ -173,26 +173,38 @@ const SPF_PREFIX = "v=spf1";
 /** `all` carrying any qualifier: the mechanism the include goes in front of. */
 const ALL_MECHANISM = /^[+\-~?]?all$/i;
 
+/** ACS verifies only against a hard fail; `~all` is rejected outright. */
+const ACS_SPF_ALL = "-all";
+
 /** ACS's include, with or without an explicit qualifier (`+include:` is an include). */
 const ACS_INCLUDE_MECHANISM = /^[+\-~?]?include:spf\.protection\.outlook\.com$/i;
 
 /**
- * Fold ACS's include into an SPF record that is already published.
+ * Fold ACS's include into an SPF record that is already published, and force
+ * the record to end in `-all`.
  *
- * The include is inserted immediately BEFORE the trailing `all`, whose
- * qualifier is copied through untouched — promoting a `~all` to `-all` would
- * start bouncing the owner's existing mail, which is the exact harm this
- * function exists to prevent. A record with no `all` (a `redirect=` record, or
- * a bare `v=spf1`) gets the include appended, since anything else would
- * reorder terms whose meaning we cannot see.
+ * The `-all` is not a stylistic choice. ACS's verifier accepts extra
+ * mechanisms happily, but rejects any record whose `all` is not a hard fail —
+ * measured, not guessed: two domains identical but for the qualifier, the
+ * `-all` one verified and the `~all` one came back `DnsRecordsNotMatched`.
+ * So a merged record that preserves `~all` can never verify on ACS, and the
+ * domain simply never becomes sendable.
+ *
+ * This does change the owner's policy: under `~all` a sender missing from the
+ * record is a soft fail and usually still delivered, while under `-all` it is
+ * rejected. Every legitimate sender must therefore already be enumerated in
+ * the record. That is why the merge carries a `note` saying so — it is the
+ * operator's call to make, not a silent rewrite.
+ *
+ * A record with no `all` (a `redirect=` record, or a bare `v=spf1`) gets the
+ * include and `-all` appended, since anything else would reorder terms whose
+ * meaning we cannot see.
  *
  * Pure and exported so it can be unit-tested with no transport at all.
  */
 export function mergeSpf(existing: string): string {
   const trimmed = existing.trim();
   const tokens = trimmed.split(/\s+/);
-  // Already satisfied — the owner must not be told to change anything.
-  if (tokens.some((t) => ACS_INCLUDE_MECHANISM.test(t))) return trimmed;
 
   // Last `all`, never the version term at index 0.
   let at = -1;
@@ -202,9 +214,25 @@ export function mergeSpf(existing: string): string {
       break;
     }
   }
-  if (at === -1) return [...tokens, ACS_SPF_INCLUDE].join(" ");
-  tokens.splice(at, 0, ACS_SPF_INCLUDE);
+
+  const hasInclude = tokens.some((t) => ACS_INCLUDE_MECHANISM.test(t));
+  if (at === -1) {
+    // No `all` to rewrite: append what is missing and terminate the record.
+    const out = hasInclude ? [...tokens] : [...tokens, ACS_SPF_INCLUDE];
+    return [...out, ACS_SPF_ALL].join(" ");
+  }
+
+  if (!hasInclude) tokens.splice(at, 0, ACS_SPF_INCLUDE);
+  // Rewrite the qualifier in place; the include may have shifted `all` right.
+  const allAt = hasInclude ? at : at + 1;
+  tokens[allAt] = ACS_SPF_ALL;
   return tokens.join(" ");
+}
+
+/** True when a record already satisfies ACS: include present AND a hard fail. */
+export function satisfiesAcs(record: string): boolean {
+  const tokens = record.trim().split(/\s+/);
+  return tokens.some((t) => ACS_INCLUDE_MECHANISM.test(t)) && tokens.some((t) => t.toLowerCase() === ACS_SPF_ALL);
 }
 
 /** The SPF record's final value, plus the operator-facing `note` explaining it. */
@@ -260,15 +288,24 @@ export async function planSpfRecord(
 
   const existing = found[0];
   const merged = mergeSpf(existing);
-  if (merged === existing) {
+  if (satisfiesAcs(existing) && merged === existing) {
     return {
       value: existing,
       note: "This domain's existing SPF record already authorises ACS. It is shown verbatim — publish it unchanged.",
     };
   }
+
+  // Whether the qualifier changed decides how loud the note has to be: adding
+  // an include is routine, but turning a soft fail into a hard one changes how
+  // receivers treat every sender missing from the record.
+  const hardened = !/\s-all$/i.test(existing.trim()) && /\s-all$/i.test(merged);
   return {
     value: merged,
-    note: "Merged with the SPF record already published on this domain. Replace that record with this value wholesale — a domain may hold only one SPF record.",
+    note: hardened
+      ? "Merged with the SPF record already published on this domain, and the final `all` was changed to `-all` because ACS refuses to verify anything softer. " +
+        "Replace the existing record with this value wholesale — a domain may hold only one SPF record. " +
+        "Check first that every service sending as this domain appears above: under `-all` a sender that is missing is rejected outright, where before it was only marked suspicious."
+      : "Merged with the SPF record already published on this domain. Replace that record with this value wholesale — a domain may hold only one SPF record.",
   };
 }
 

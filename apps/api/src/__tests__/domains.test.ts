@@ -267,7 +267,7 @@ describe("verifyPendingDomains", () => {
 describe("reprovisionDomain", () => {
   const SMTP_ROW = { id: "car_smtp", name: "cpanel-smtp", enabled: true };
   const SES_ROW = { id: "car_ses", name: "ses-mailroom", enabled: true };
-  const ACS_ROW = { id: "car_acs", name: "acs-amlify", enabled: true };
+  const ACS_ROW = { id: "car_acs", name: "acs-mailroom", enabled: true };
 
   const ACS_RECORDS = [
     {

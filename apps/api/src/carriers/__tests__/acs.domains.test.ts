@@ -453,6 +453,150 @@ describe("checkDomain when all four verify", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Sender usernames
+// ---------------------------------------------------------------------------
+
+/**
+ * ACS refuses a send from an address whose username is not registered on the
+ * domain, and only says so at send time — provisioning and verification both
+ * look perfectly healthy first. So the registered set has to be exactly what
+ * Mailroom holds, per domain: `support@tintinpos.com` is no business of
+ * `maro.com.au`.
+ */
+describe("sender usernames", () => {
+  const allVerified = states("Verified", "Verified", "Verified", "Verified");
+  const CHILD_PATH = `${DOMAIN_PATH}/senderUsernames`;
+  const ARM_PREFIX = `${ARM_BASE}/subscriptions/sub-1/resourceGroups/rg-amlify-email/providers/Microsoft.Communication`;
+
+  /**
+   * A domain whose four records have all verified, plus a fake
+   * `senderUsernames` child collection. `held` is what ACS already has
+   * registered; `deleted` records every child resource the provisioner removed.
+   */
+  function senderArm(
+    held: string[] = [],
+    arm: AcsArmConfig = ARM,
+    opts: { deleteStatus?: number } = {},
+  ) {
+    const deleted: string[] = [];
+    const deleteStatus = opts.deleteStatus ?? 200;
+    const { provisioner, calls } = fakeArm(
+      [
+        {
+          match: `DELETE ${ARM_BASE}`,
+          status: deleteStatus,
+          reply: (c) => {
+            if (deleteStatus < 300) {
+              deleted.push(c.url.split("/senderUsernames/")[1]);
+              return {};
+            }
+            return { error: { code: "Conflict", message: "sender is in use" } };
+          },
+        },
+        { match: `PUT ${ARM_BASE}`, reply: () => ({}) },
+        { match: `PATCH ${ARM_BASE}`, reply: () => ({}) },
+        {
+          match: `GET ${ARM_PREFIX}/${CHILD_PATH}`,
+          reply: () => ({ value: held.map((u) => ({ name: u, properties: { username: u } })) }),
+        },
+        // Already linked, so nothing here PATCHes the Communication Service.
+        { match: `GET ${ARM_PREFIX}/${ACS_PATH}`, reply: () => ({ properties: { linkedDomains: [DOMAIN_ID] } }) },
+        { match: `GET ${ARM_BASE}`, reply: () => domainResource(allVerified) },
+      ],
+      noTxt,
+      arm,
+    );
+    return { provisioner, calls, deleted };
+  }
+
+  /** The `properties` of every sender-username PUT, in the order they went out. */
+  function registered(calls: Call[]) {
+    return armCalls(calls)
+      .filter((c) => c.method === "PUT" && c.url.includes("/senderUsernames/"))
+      .map((c) => c.body.properties);
+  }
+
+  it("registers the domain's own senders in place of the carrier's", async () => {
+    const { provisioner, calls } = senderArm([], { ...ARM, senderUsernames: ["billing"] });
+    const res = await provisioner.checkDomain(DOMAIN, {
+      mailFromDomain: DOMAIN,
+      senders: [{ username: "support", displayName: "TinTin POS Support" }],
+    });
+
+    expect(res.status).toBe("VERIFIED");
+    expect(registered(calls)).toEqual([{ username: "support", displayName: "TinTin POS Support" }]);
+  });
+
+  it("falls back to the carrier list when the domain has none", async () => {
+    const { provisioner, calls } = senderArm([], { ...ARM, senderUsernames: ["billing"] });
+    await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN, senders: [] });
+
+    expect(registered(calls).map((p) => p.username)).toEqual(["billing"]);
+  });
+
+  it("falls back to the noreply/donotreply defaults when neither is set", async () => {
+    const { provisioner, calls } = senderArm();
+    await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN });
+
+    expect(registered(calls).map((p) => p.username)).toEqual(["noreply", "donotreply"]);
+  });
+
+  // Operators paste addresses, not local parts — the per-domain list goes
+  // through exactly the same normalisation the carrier-level one does.
+  it("normalises a per-domain full address down to its local part", async () => {
+    const { provisioner, calls } = senderArm();
+    await provisioner.checkDomain(DOMAIN, {
+      mailFromDomain: DOMAIN,
+      senders: [
+        { username: "support@tintinpos.com", displayName: "TinTin POS Support" },
+        { username: "Sales <sales@tintinpos.com>" },
+      ],
+    });
+
+    expect(registered(calls)).toEqual([
+      { username: "support", displayName: "TinTin POS Support" },
+      { username: "sales", displayName: "sales" },
+    ]);
+  });
+
+  // The whole point of the reconcile: a PUT only ever adds, so without the
+  // DELETE an address removed in the dashboard would keep sending and the UI
+  // would be lying.
+  it("DELETEs a sender ACS holds that the domain no longer lists", async () => {
+    const { provisioner, calls, deleted } = senderArm(["support", "olduser", "noreply"]);
+    await provisioner.checkDomain(DOMAIN, {
+      mailFromDomain: DOMAIN,
+      senders: [{ username: "support" }],
+    });
+
+    expect(registered(calls).map((p) => p.username)).toEqual(["support"]);
+    expect(deleted).toEqual(["olduser", "noreply"]);
+  });
+
+  it("deletes nothing when no list is configured at either level", async () => {
+    const { provisioner, deleted } = senderArm(["support", "olduser"]);
+    await provisioner.checkDomain(DOMAIN, { mailFromDomain: DOMAIN, senders: [] });
+
+    // "Not configured" is not "delete everything" — these may well have been
+    // added by hand in the Azure portal.
+    expect(deleted).toEqual([]);
+  });
+
+  it("still reports VERIFIED when a delete fails", async () => {
+    const { provisioner, deleted } = senderArm(["olduser"], ARM, { deleteStatus: 409 });
+    const res = await provisioner.checkDomain(DOMAIN, {
+      mailFromDomain: DOMAIN,
+      senders: [{ username: "support" }],
+    });
+
+    // A sender we could not remove is stale, not a reason to fail the domain.
+    expect(res.status).toBe("VERIFIED");
+    expect(res.error).toBeUndefined();
+    expect(deleted).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // deleteDomain
 // ---------------------------------------------------------------------------
 

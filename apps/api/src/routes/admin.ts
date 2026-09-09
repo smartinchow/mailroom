@@ -78,6 +78,22 @@ function toAdminDomain(d: AdminDomainRow) {
   };
 }
 
+/**
+ * One sender address for `Domain.senderUsernames`. A bare string is the form
+ * an operator types (one address per line in the dashboard), so it is accepted
+ * and widened here; the carrier does the real parsing, since what reduces
+ * `Support <support@x.com>` to a local part is provider knowledge.
+ */
+const senderUsernameSchema = z
+  .union([
+    z.string().trim().min(1).max(320),
+    z.object({
+      username: z.string().trim().min(1).max(320),
+      displayName: z.string().trim().max(120).optional(),
+    }),
+  ])
+  .transform((entry) => (typeof entry === "string" ? { username: entry } : entry));
+
 function sendAdminDomainError(reply: FastifyReply, err: unknown): FastifyReply {
   if (err instanceof DomainError) return reply.code(err.status).send({ error: err.code, ...err.extra });
   throw err;
@@ -458,6 +474,9 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     carrierId: z.string().nullable().optional(),
     fallbackCarrierId: z.string().nullable().optional(),
     notes: z.string().max(1000).nullable().optional(),
+    // Capped: this is a per-domain sender list, not a mailing list, and every
+    // entry costs one ARM round trip on every verification sweep.
+    senderUsernames: z.array(senderUsernameSchema).max(25).optional(),
   });
 
   app.get("/v1/admin/domains/:id", async (req, reply) => {
@@ -488,7 +507,7 @@ export function registerAdminRoutes(app: FastifyInstance): void {
     const { id } = req.params as { id: string };
     const parsed = domainSchema.partial().omit({ name: true }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
-    const { carrierId, ...rest } = parsed.data;
+    const { carrierId, senderUsernames, ...rest } = parsed.data;
     try {
       // A bare FK write would move the domain to a carrier that has never
       // heard of it — VERIFIED here, registered nowhere, every send failing at
@@ -496,12 +515,38 @@ export function registerAdminRoutes(app: FastifyInstance): void {
       // so a carrier change is routed to the same service the reprovision
       // endpoint uses; only the metadata fields are written directly.
       if (carrierId) await reprovisionDomain(id, carrierId);
-      const domain = await prisma.domain.update({
-        where: { id },
-        data: rest,
-        include: adminDomainInclude,
+
+      const before = senderUsernames
+        ? await prisma.domain.findUnique({ where: { id }, select: { status: true, senderUsernames: true } })
+        : null;
+
+      const data: Prisma.DomainUncheckedUpdateInput = { ...rest };
+      if (senderUsernames) data.senderUsernames = senderUsernames as unknown as Prisma.InputJsonValue;
+
+      let domain = await prisma.domain.update({ where: { id }, data, include: adminDomainInclude });
+
+      // The provider only learns the sender list when the domain is checked,
+      // and the poller checks nothing that is already VERIFIED — so without
+      // this an edit would sit unapplied and the domain would keep sending as
+      // whatever it was verified with. Same code path the poller runs, never a
+      // second one. The write above has already committed on purpose: a
+      // provider hiccup must cost the sync, never the operator's saved list.
+      let senderSyncError: string | null = null;
+      const changed =
+        senderUsernames && JSON.stringify(before?.senderUsernames ?? []) !== JSON.stringify(senderUsernames);
+      if (changed && before?.status === "VERIFIED") {
+        try {
+          await checkDomain(id);
+          domain = await prisma.domain.findUniqueOrThrow({ where: { id }, include: adminDomainInclude });
+        } catch (err) {
+          senderSyncError = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      return reply.send({
+        ...toAdminDomain(domain),
+        ...(senderSyncError ? { senderSyncError: senderSyncError.slice(0, 500) } : {}),
       });
-      return reply.send(toAdminDomain(domain));
     } catch (err) {
       return sendAdminDomainError(reply, err);
     }

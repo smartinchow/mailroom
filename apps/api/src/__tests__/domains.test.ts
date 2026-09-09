@@ -22,6 +22,7 @@ const {
   VERIFICATION_WINDOW_MS,
   EXPIRED_MESSAGE,
   applyExpiry,
+  checkDomain,
   normalizeDomainName,
   reprovisionDomain,
   toPublicDomain,
@@ -149,6 +150,7 @@ describe("toPublicDomain", () => {
         status: "VERIFIED",
       },
     ] as never,
+    senderUsernames: [{ username: "support", displayName: "Support" }] as never,
     mailFromDomain: "send.example.com",
     lastCheckedAt: null,
     verificationError: null,
@@ -188,6 +190,7 @@ describe("toPublicDomain", () => {
           note: null,
         },
       ],
+      sender_usernames: [{ username: "support", displayName: "Support" }],
       verified_at: null,
       last_checked_at: null,
       verification_error: null,
@@ -221,6 +224,7 @@ describe("verifyPendingDomains", () => {
       notes: null,
       status: "PENDING" as const,
       dnsRecords: [],
+      senderUsernames: [],
       mailFromDomain: null,
       lastCheckedAt: null,
       verificationError: null,
@@ -253,9 +257,88 @@ describe("verifyPendingDomains", () => {
 
     // Both domains were attempted — the first's failure never aborted the batch.
     expect(checkDomain).toHaveBeenCalledTimes(2);
-    expect(checkDomain).toHaveBeenNthCalledWith(1, "a.example.com", { mailFromDomain: "send.a.example.com" });
-    expect(checkDomain).toHaveBeenNthCalledWith(2, "b.example.com", { mailFromDomain: "send.b.example.com" });
+    expect(checkDomain).toHaveBeenNthCalledWith(1, "a.example.com", {
+      mailFromDomain: "send.a.example.com",
+      senders: [],
+    });
+    expect(checkDomain).toHaveBeenNthCalledWith(2, "b.example.com", {
+      mailFromDomain: "send.b.example.com",
+      senders: [],
+    });
     expect(result).toEqual({ checked: 1, verified: 1, failed: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkDomain status guard
+// ---------------------------------------------------------------------------
+
+describe("checkDomain on an already-verified domain", () => {
+  const CARRIER_ROW = { id: "car_1", name: "acs-mailroom" };
+
+  function verifiedRow() {
+    return {
+      id: "dom_v",
+      name: "tintinpos.com",
+      projectId: "proj_1",
+      carrierId: CARRIER_ROW.id,
+      fallbackCarrierId: null,
+      verifiedAt: new Date("2026-09-08T00:00:00.000Z"),
+      notes: null,
+      status: "VERIFIED" as const,
+      dnsRecords: [],
+      senderUsernames: [],
+      mailFromDomain: "tintinpos.com",
+      lastCheckedAt: null,
+      verificationError: null,
+      createdAt: new Date("2026-09-08T00:00:00.000Z"),
+      carrier: { id: CARRIER_ROW.id, name: CARRIER_ROW.name, type: "ACS" as const },
+    };
+  }
+
+  // A sender-list edit re-runs checkDomain against a live domain. A provider
+  // blip there must not drop it out of the D-07 send gate.
+  it("keeps VERIFIED when the provider reports a transient failure", async () => {
+    const row = verifiedRow();
+    mockPrisma.domain.findUnique.mockResolvedValue(row);
+    mockPrisma.carrier.findUnique.mockResolvedValue(CARRIER_ROW);
+    mockCarrierFor.mockReturnValue({
+      domains: {
+        mailFromFor: (name: string) => name,
+        checkDomain: vi.fn().mockResolvedValue({ status: "TEMPORARY_FAILURE", records: [], error: "ARM 503" }),
+      },
+    });
+    mockPrisma.domain.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({
+      ...row,
+      ...data,
+    }));
+
+    const out = await checkDomain(row.id);
+
+    expect(out.status).toBe("VERIFIED");
+    expect(mockPrisma.domain.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ status: "VERIFIED", verificationError: null }) }),
+    );
+  });
+
+  // The guard is narrow on purpose: a real FAILED verdict still lands.
+  it("still accepts a FAILED verdict on a verified domain", async () => {
+    const row = verifiedRow();
+    mockPrisma.domain.findUnique.mockResolvedValue(row);
+    mockPrisma.carrier.findUnique.mockResolvedValue(CARRIER_ROW);
+    mockCarrierFor.mockReturnValue({
+      domains: {
+        mailFromFor: (name: string) => name,
+        checkDomain: vi.fn().mockResolvedValue({ status: "FAILED", records: [], error: "domain not found at provider" }),
+      },
+    });
+    mockPrisma.domain.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({
+      ...row,
+      ...data,
+    }));
+
+    const out = await checkDomain(row.id);
+    expect(out.status).toBe("FAILED");
   });
 });
 

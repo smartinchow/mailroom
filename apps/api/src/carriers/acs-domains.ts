@@ -1,6 +1,6 @@
 import { resolveTxt as dnsResolveTxt } from "node:dns/promises";
 import type { DomainStatus } from "@prisma/client";
-import type { AcsArmConfig, DnsRecord, DomainProvisioner } from "./types.js";
+import type { AcsArmConfig, DnsRecord, DomainProvisioner, SenderIdentity } from "./types.js";
 
 /**
  * ACS domain provisioning over Azure Resource Manager.
@@ -45,22 +45,32 @@ const TOKEN_SKEW_MS = 60_000;
  * one is part of making the domain usable. `donotreply` is the ACS default and
  * `noreply` is the house convention (docs/DESIGN.md).
  *
- * These are only the defaults. Real projects send from addresses like
- * `support@` or `sales@`, and a domain whose username is missing here fails at
- * send time with an ACS validation error rather than anything Mailroom can
- * see at provisioning time — so the list is overridable per carrier via
- * `AcsArmConfig.senderUsernames`, editable in the dashboard without a deploy.
+ * These are only the last resort. Real projects send from addresses like
+ * `support@` or `sales@`, and a domain whose username is missing fails at send
+ * time with an ACS validation error rather than anything Mailroom can see at
+ * provisioning time. Three levels, most specific first: the domain's own
+ * `senders` (set per domain in the dashboard — `support@tintinpos.com` is no
+ * business of `maro.com.au`), then the carrier-wide
+ * `AcsArmConfig.senderUsernames`, then these.
  */
 const DEFAULT_SENDER_USERNAMES: { username: string; displayName: string }[] = [
   { username: "noreply", displayName: "No Reply" },
   { username: "donotreply", displayName: "Do Not Reply" },
 ];
 
-/** A username is a bare local part: no `@`, no display name, no spaces. */
+/**
+ * A username is a bare local part: no `@`, no display name, no spaces. Accepts
+ * what an operator actually types — `support`, `support@tintinpos.com`,
+ * `Support <support@tintinpos.com>` — and deduplicates case-insensitively.
+ *
+ * Returns an empty array when nothing usable was supplied, so a caller can
+ * tell "not configured" from "configured, and this is the list". Choosing the
+ * fallback is `sendersFor`'s job, not this one's.
+ */
 function normalizeSenders(
   configured: readonly (string | { username: string; displayName?: string })[] | undefined,
 ): { username: string; displayName: string }[] {
-  if (!configured?.length) return DEFAULT_SENDER_USERNAMES;
+  if (!configured?.length) return [];
   const out = new Map<string, { username: string; displayName: string }>();
   for (const entry of configured) {
     const raw = typeof entry === "string" ? entry : entry.username;
@@ -73,7 +83,7 @@ function normalizeSenders(
     const displayName = (typeof entry === "string" ? undefined : entry.displayName) ?? username;
     out.set(username.toLowerCase(), { username, displayName });
   }
-  return out.size ? [...out.values()] : DEFAULT_SENDER_USERNAMES;
+  return [...out.values()];
 }
 
 /** The four verification types ACS reports records for, in publish order. */
@@ -401,7 +411,7 @@ export function createAcsDomainProvisioner(
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const now = deps.now ?? (() => Date.now());
   const resolveTxt = deps.resolveTxt ?? dnsResolveTxt;
-  const senders = normalizeSenders(arm.senderUsernames);
+  const carrierSenders = normalizeSenders(arm.senderUsernames);
 
   /** Cached client-credentials token. Never logged, never returned. */
   let token: { value: string; expiresAt: number } | null = null;
@@ -561,13 +571,61 @@ export function createAcsDomainProvisioner(
     await call("PATCH", acsUrl, { properties: { linkedDomains: remaining } });
   }
 
-  /** PUT is an upsert, so this is safe to repeat on every later check. */
-  async function ensureSenderUsernames(name: string): Promise<void> {
-    for (const sender of senders) {
-      const { headers } = await call("PUT", domainUrl(name, `/senderUsernames/${sender.username}`), {
-        properties: { username: sender.username, displayName: sender.displayName },
-      });
+  /**
+   * Reconcile the domain's registered senders with the list Mailroom holds.
+   *
+   * PUT is an upsert, so re-registering on every later check is free — but a
+   * PUT only ever ADDS. Sender usernames are separate ARM child resources, so
+   * an address the operator deleted in the dashboard would stay live at ACS
+   * and keep sending, and the dashboard would be lying about who can. Hence
+   * the second half: LIST what ACS actually holds and delete whatever we did
+   * not ask for.
+   */
+  async function ensureSenderUsernames(name: string, requested?: readonly SenderIdentity[]): Promise<void> {
+    // The domain's own list wins; the carrier's stands in for a domain that
+    // has none. Empty means nobody has stated one at all.
+    const own = normalizeSenders(requested);
+    const configured = own.length ? own : carrierSenders;
+    const wanted = configured.length ? configured : DEFAULT_SENDER_USERNAMES;
+
+    for (const sender of wanted) {
+      const { headers } = await call(
+        "PUT",
+        domainUrl(name, `/senderUsernames/${encodeURIComponent(sender.username)}`),
+        { properties: { username: sender.username, displayName: sender.displayName } },
+      );
       await awaitLro(headers);
+    }
+
+    // "Not configured" is not "delete everything". With no list stated at
+    // either level there is nothing to reconcile against — only the defaults,
+    // which are a floor, not an instruction — and pruning here would quietly
+    // remove senders an operator added in the Azure portal.
+    if (!configured.length) return;
+
+    // Everything past here is cleanup: a sender we failed to remove is stale,
+    // which is not a reason to fail the domain's verification. Swallowed the
+    // way `initiate` swallows, and retried on the next sweep.
+    let registered: { name?: string; properties?: { username?: string } }[];
+    try {
+      const { body } = await call("GET", domainUrl(name, "/senderUsernames"));
+      registered = Array.isArray(body?.value) ? body.value : [];
+    } catch {
+      return;
+    }
+
+    const keep = new Set(configured.map((s) => s.username.toLowerCase()));
+    for (const entry of registered) {
+      // ARM child resources carry the username both as the resource name and
+      // in properties; either one identifies what to delete.
+      const username = String(entry?.properties?.username ?? entry?.name ?? "").trim();
+      if (!username || keep.has(username.toLowerCase())) continue;
+      try {
+        const { headers } = await call("DELETE", domainUrl(name, `/senderUsernames/${encodeURIComponent(username)}`));
+        await awaitLro(headers);
+      } catch {
+        // Deliberately swallowed, as above.
+      }
     }
   }
 
@@ -596,7 +654,7 @@ export function createAcsDomainProvisioner(
       return { records: await recordsFor(name, resource) };
     },
 
-    async checkDomain(name) {
+    async checkDomain(name, opts) {
       let resource: AcsDomainResource;
       try {
         resource = await getDomain(name);
@@ -658,7 +716,7 @@ export function createAcsDomainProvisioner(
         // Both steps are idempotent, so repeating them on a later check of an
         // already-verified domain is harmless.
         try {
-          await ensureSenderUsernames(name);
+          await ensureSenderUsernames(name, opts?.senders);
           await link(name);
         } catch (err) {
           if (err instanceof ArmError && err.transient) {

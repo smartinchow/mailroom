@@ -180,6 +180,17 @@ export interface DnsRecord {
 }
 
 /**
+ * One address the domain is allowed to send as. ACS registers each of these on
+ * the domain and rejects a send from anything else — at send time, with no
+ * earlier warning. `username` is stored as the operator typed it (a local part
+ * or a full address); the carrier reduces it.
+ */
+export interface SenderUsername {
+  username: string;
+  displayName?: string;
+}
+
+/**
  * Wire shape from GET/POST /v1/admin/domains (spec docs/specs/domains.md §3, §5): the
  * spec-defined fields are snake_case, but the admin-only extras (projectSlug,
  * fallbackCarrierId, notes) are camelCase as shipped by the admin API — this mixed casing
@@ -193,6 +204,7 @@ export interface Domain {
   project_id: string | null;
   mail_from_domain: string | null;
   records: DnsRecord[];
+  sender_usernames: SenderUsername[];
   verified_at: string | null;
   last_checked_at: string | null;
   verification_error: string | null;

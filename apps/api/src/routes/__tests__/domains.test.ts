@@ -335,6 +335,7 @@ describe("POST /v1/domains/:id/verify", () => {
     expect(res.json().status).toBe("verified");
     expect(provisioner.checkDomain).toHaveBeenCalledWith("mail.amlify.au", {
       mailFromDomain: "send.mail.amlify.au",
+      senders: [],
     });
     const update = mockPrisma.domain.update.mock.calls[0][0];
     expect(update.data.status).toBe("VERIFIED");

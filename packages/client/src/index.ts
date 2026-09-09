@@ -93,6 +93,15 @@ export interface DnsRecord {
   note?: string | null;
 }
 
+/**
+ * One address the domain may send as. Set per domain by an operator; ACS
+ * registers each one and rejects a send from anything else at send time.
+ */
+export interface SenderUsername {
+  username: string;
+  displayName?: string;
+}
+
 /** A sending domain: created via `domains.create`, verified via `domains.verify`. */
 export interface Domain {
   id: string;
@@ -102,6 +111,7 @@ export interface Domain {
   projectId: string | null;
   mailFromDomain: string | null;
   records: DnsRecord[];
+  senderUsernames: SenderUsername[];
   verifiedAt: string | null;
   lastCheckedAt: string | null;
   verificationError: string | null;
@@ -117,6 +127,7 @@ interface WireDomain {
   project_id: string | null;
   mail_from_domain: string | null;
   records: DnsRecord[];
+  sender_usernames?: SenderUsername[];
   verified_at: string | null;
   last_checked_at: string | null;
   verification_error: string | null;
@@ -132,6 +143,8 @@ const fromWireDomain = (raw: WireDomain): Domain => ({
   projectId: raw.project_id,
   mailFromDomain: raw.mail_from_domain,
   records: raw.records,
+  // Optional on the wire so an older API still maps cleanly.
+  senderUsernames: raw.sender_usernames ?? [],
   verifiedAt: raw.verified_at,
   lastCheckedAt: raw.last_checked_at,
   verificationError: raw.verification_error,

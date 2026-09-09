@@ -2,7 +2,7 @@ import type { Carrier as CarrierRow, DomainStatus, Prisma } from "@prisma/client
 import { prisma } from "./db.js";
 import { logger } from "./logger.js";
 import { carrierFor } from "./carriers/index.js";
-import type { DnsRecord } from "./carriers/types.js";
+import type { DnsRecord, SenderIdentity } from "./carriers/types.js";
 
 /**
  * Mailroom-managed sending domains (spec docs/specs/domains.md).
@@ -73,6 +73,16 @@ function readRecords(value: Prisma.JsonValue): DnsRecord[] {
   return Array.isArray(value) ? (value as unknown as DnsRecord[]) : [];
 }
 
+/**
+ * The domain's own sender list, stored opaquely. Nothing here interprets an
+ * entry — what a `username` means, and how `Support <support@x.com>` reduces
+ * to a local part, is the provisioner's business (CLAUDE.md); this file only
+ * carries the list from the row to the carrier and back onto the wire.
+ */
+function readSenders(value: Prisma.JsonValue): SenderIdentity[] {
+  return Array.isArray(value) ? (value as unknown as SenderIdentity[]) : [];
+}
+
 /** The public/admin JSON for a domain. snake_case, lower-cased enums (D-05). */
 export function toPublicDomain(d: DomainWithCarrier) {
   return {
@@ -93,6 +103,7 @@ export function toPublicDomain(d: DomainWithCarrier) {
       status: String(r.status).toLowerCase(),
       note: r.note ?? null,
     })),
+    sender_usernames: readSenders(d.senderUsernames),
     verified_at: d.verifiedAt,
     last_checked_at: d.lastCheckedAt,
     verification_error: d.verificationError,
@@ -111,6 +122,12 @@ export interface CreateDomainInput {
   carrierId?: string | null;
   fallbackCarrierId?: string | null;
   notes?: string | null;
+  /**
+   * The addresses this domain may send as. Admin only — the public route never
+   * offers it, because the list is an operator decision about the provider
+   * account, not something an API key should be able to widen.
+   */
+  senderUsernames?: SenderIdentity[];
 }
 
 async function resolveCarrier(carrierId?: string | null): Promise<CarrierRow> {
@@ -154,6 +171,7 @@ export async function createDomain(input: CreateDomainInput): Promise<DomainWith
     notes: input.notes ?? null,
     status: "VERIFIED",
     dnsRecords: [],
+    senderUsernames: (input.senderUsernames ?? []) as unknown as Prisma.InputJsonValue,
     mailFromDomain: null,
     verifiedAt: new Date(),
   };
@@ -227,8 +245,29 @@ export async function checkDomain(id: string): Promise<DomainWithCarrier> {
   const createdAt = restarted ? new Date() : domain.createdAt;
   const mailFromDomain = domain.mailFromDomain ?? carrier.domains.mailFromFor(domain.name);
 
-  const result = await carrier.domains.checkDomain(domain.name, { mailFromDomain });
-  const { status, error } = applyExpiry(result.status, createdAt, result.error ?? null);
+  // The sender list rides along on every check: registering it is a side
+  // effect of verification (see `DomainProvisioner.checkDomain`), and this is
+  // also the path an edit to the list is pushed through.
+  const result = await carrier.domains.checkDomain(domain.name, {
+    mailFromDomain,
+    senders: readSenders(domain.senderUsernames),
+  });
+  const expired = applyExpiry(result.status, createdAt, result.error ?? null);
+
+  // A provider blip must not un-verify a domain that is already sending. The
+  // poller never reaches a VERIFIED domain, so a check on one only happens on
+  // a manual re-verify or a sender-list edit — and there, reporting
+  // TEMPORARY_FAILURE would take the domain out of the D-07 send gate until
+  // the next sweep recovers it. Editing a display name must not stop mail.
+  const wouldRegress = domain.status === "VERIFIED" && expired.status === "TEMPORARY_FAILURE";
+  const status = wouldRegress ? "VERIFIED" : expired.status;
+  const error = wouldRegress ? null : expired.error;
+  if (wouldRegress) {
+    logger.warn(
+      { domain: domain.name, err: expired.error },
+      "provider check failed transiently on a verified domain; keeping VERIFIED",
+    );
+  }
 
   const data: Prisma.DomainUncheckedUpdateInput = {
     status,

@@ -9,6 +9,19 @@ function str(fd: FormData, name: string): string {
   return String(fd.get(name) ?? "").trim();
 }
 
+/**
+ * One sender address per line, as typed: `support@tintinpos.com` or
+ * `Support <support@tintinpos.com>`. Sent through verbatim — reducing an
+ * address to the local part the provider wants is the carrier's job, not the
+ * dashboard's.
+ */
+function lines(fd: FormData, name: string): string[] {
+  return String(fd.get(name) ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
 /** Add domain (Settings → Domains). On failure, bounces back with ?error=<code>. */
 export async function createDomain(formData: FormData) {
   const projectId = str(formData, "projectId");
@@ -37,10 +50,10 @@ export async function createDomain(formData: FormData) {
 }
 
 /**
- * Update project / fallback carrier / notes (detail page "Edit" section). The primary
- * carrier is only sent when the form includes it (manual domains, no DNS records) —
- * provisioned (SES) domains keep their carrier select hidden since the identity lives on
- * that carrier.
+ * Update project / fallback carrier / notes / sender addresses (detail page "Edit"
+ * section). The primary carrier is only sent when the form includes it (manual domains,
+ * no DNS records) — provisioned (SES) domains keep their carrier select hidden since the
+ * identity lives on that carrier.
  */
 export async function updateDomain(formData: FormData) {
   const id = str(formData, "id");
@@ -50,6 +63,9 @@ export async function updateDomain(formData: FormData) {
   const carrierId = str(formData, "carrierId");
   const fallbackCarrierId = str(formData, "fallbackCarrierId");
   const notes = str(formData, "notes");
+  // Only sent when the form actually rendered the field — an absent textarea
+  // must read as "unchanged", never as "the operator cleared the list".
+  const senderUsernames = formData.has("senderUsernames") ? lines(formData, "senderUsernames") : null;
 
   try {
     await api<Domain>(`/domains/${encodeURIComponent(id)}`, {
@@ -59,6 +75,7 @@ export async function updateDomain(formData: FormData) {
         ...(carrierId ? { carrierId } : {}),
         fallbackCarrierId: fallbackCarrierId || null,
         notes: notes || null,
+        ...(senderUsernames ? { senderUsernames } : {}),
       }),
     });
   } catch (err) {

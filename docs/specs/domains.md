@@ -43,6 +43,7 @@ model Domain {
   // fallbackCarrierId?, verifiedAt?, notes?
   status          DomainStatus @default(PENDING)
   dnsRecords      Json         @default("[]")   // DnsRecord[] (below)
+  senderUsernames Json         @default("[]")   // { username, displayName? }[] (§2a)
   mailFromDomain  String?                        // "send.<name>" for SES
   lastCheckedAt   DateTime?
   verificationError String?
@@ -54,6 +55,10 @@ model Carrier {
   isDefault Boolean @default(false)   // exactly one carrier may be default; enforce in code
 }
 ```
+
+`senderUsernames` arrived later, in `20260909093000_domain_sender_usernames`: a plain
+`ADD COLUMN … JSONB NOT NULL DEFAULT '[]'`, so every existing domain starts "not
+configured" and keeps whatever its carrier configures (§2a).
 
 Migration data fix-ups (SQL in the migration, not a script):
 - All existing `Domain` rows → `status = 'VERIFIED'`, `verifiedAt = COALESCE(verifiedAt, now())`.
@@ -91,8 +96,15 @@ export interface DomainProvisioner {
   mailFromFor(name: string): string;
   /** Register the identity with the provider. Idempotent: if it already exists, return its records. */
   createDomain(name: string, opts: { mailFromDomain: string }): Promise<{ records: DnsRecord[] }>;
-  /** Ask the provider for the current verification state and per-record status. */
-  checkDomain(name: string, opts: { mailFromDomain: string }): Promise<{
+  /**
+   * Ask the provider for the current verification state and per-record status.
+   *
+   * `opts.senders` is the domain's own sender list (§2a). A provisioner
+   * registers exactly these once the domain verifies and removes any sender it
+   * holds that is not among them; empty or absent means "not configured" —
+   * fall back to whatever the carrier configures, and remove nothing.
+   */
+  checkDomain(name: string, opts: { mailFromDomain: string; senders?: SenderIdentity[] }): Promise<{
     status: DomainStatus;
     records: DnsRecord[];     // same records as createDomain, with fresh status
     error?: string;
@@ -105,7 +117,50 @@ export interface Carrier {
   // existing: type, send, verifyHook, parseEvents
   domains?: DomainProvisioner;
 }
+
+/** One address a domain may send as; `username` is as the operator typed it. */
+export interface SenderIdentity {
+  username: string;
+  displayName?: string;
+}
 ```
+
+`domains.ts` reads `Domain.senderUsernames` off the row and passes it straight through as
+`senders`. It never interprets an entry — what a username means, and how
+`Support <support@x.com>` reduces to a local part, is provider knowledge and stays inside
+`carriers/`.
+
+### 2a. Per-domain sender addresses
+
+ACS refuses a send from an address whose local part is not registered as a *sender
+username* on that domain, and the refusal only arrives **at send time** — provisioning and
+verification both look perfectly healthy first. The list therefore has to be right, and it
+has to be per domain: `support@tintinpos.com` is no business of `maro.com.au`, and each
+project wants its own display name (`TinTin POS Support`, not `support`).
+
+`Domain.senderUsernames` holds it, as `{ username, displayName? }[]`. `username` is stored
+as the operator typed it — a bare local part, a full address, or
+`Support <support@tintinpos.com>` — because normalising it is the carrier's job.
+
+**Resolution, most specific first.** The domain's own list; else the carrier-wide
+`AcsArmConfig.senderUsernames`; else the built-in `noreply` / `donotreply` defaults. Both
+configured levels go through the *same* `normalizeSenders` — local part only, deduplicated
+case-insensitively — so an operator can paste an address and get the right thing.
+
+**Removal semantics.** Sender usernames are separate ARM child resources and a `PUT` only
+ever *adds*, so dropping an address from the list in Mailroom would leave it live at ACS,
+still sending, with the dashboard claiming otherwise. `ensureSenderUsernames` therefore
+reconciles: after PUTting the wanted set it `GET`s
+`.../domains/{domain}/senderUsernames?api-version=2023-04-01` and `DELETE`s every entry
+Mailroom did not ask for. Two safety rules:
+
+- **Nothing configured at either level deletes nothing.** The defaults are a floor, not an
+  instruction; pruning against them would quietly remove senders an operator added by hand
+  in the Azure portal.
+- **A failed delete is swallowed**, like `initiate`. A sender that could not be removed is
+  stale, which is not a reason to fail the domain's verification; the next sweep retries.
+
+SES ignores `senders` entirely — it has no equivalent concept.
 
 ### SES implementation (`apps/api/src/carriers/ses.ts`)
 
@@ -173,9 +228,10 @@ before D-15.
   `FAILED` with "domain not found at provider".
 - **Two side effects only run once every record is `Verified`**, both idempotent so
   repeating them on a later check of an already-verified domain is harmless:
-  1. `ensureSenderUsernames` — `PUT` (upsert) `noreply` and `donotreply` sender usernames on
-     the domain. ACS refuses to send from a username that isn't registered, so this is part
-     of making a freshly verified domain actually usable, not an afterthought.
+  1. `ensureSenderUsernames` — reconcile the domain's sender usernames with the list
+     Mailroom holds (§2a): `PUT` (upsert) each wanted one, then LIST and `DELETE` anything
+     else ACS holds. ACS refuses to send from a username that isn't registered, so this is
+     part of making a freshly verified domain actually usable, not an afterthought.
   2. `link(name)` — add the domain's ARM resource id to the Communication Service's
      `linkedDomains`. **This is a read-modify-write, not a plain write.** The ARM PATCH
      replaces the entire `linkedDomains` array; the implementation always `GET`s the current
@@ -249,12 +305,14 @@ Single module used by both public and admin routes and by the poller.
   "mail_from_domain": "send.example.com",
   "records": [ { "type": "CNAME", "name": "…", "value": "…", "priority": null, "ttl": 300,
                  "purpose": "dkim", "required": true, "status": "pending" } ],
+  "sender_usernames": [ { "username": "support", "displayName": "TinTin POS Support" } ],
   "verified_at": null, "last_checked_at": null, "verification_error": null,
   "created_at": "2026-09-04T…Z"
 }
 ```
 
-  Enum values are lower-cased on the wire (`pending|verified|failed|temporary_failure`,
+  `sender_usernames` is echoed verbatim from the row, `displayName` and all — it is stored
+  JSON, not a spec-defined scalar, so it is not re-cased. Enum values are lower-cased on the wire (`pending|verified|failed|temporary_failure`,
   `dkim|mail_from_mx|mail_from_spf|dmarc`). Public API is snake_case like `/v1/emails`
   (D-05); admin API returns the same object.
 
@@ -291,8 +349,20 @@ Error body shape follows existing routes: `{ "error": "<code>", ... }`.
   - `PATCH /v1/admin/domains/:id` still writes `carrierId` on its own — it is a metadata
     edit, and it does **not** provision. Use it only for a domain whose new carrier already
     holds the identity; otherwise use reprovision.
-- `GET /v1/admin/domains` and `PATCH` return the full domain object (§3) plus `projectSlug`,
-  `fallbackCarrierId`, `notes`.
+- `POST /v1/admin/domains` and `PATCH /v1/admin/domains/:id` accept `senderUsernames`: an
+  array (max 25) of either a non-empty string or `{ username, displayName? }`, with a bare
+  string widened to `{ username }`. Admin only — the public route never offers it, because
+  widening who may send is an operator decision about the provider account, not something
+  an API key should make.
+  - **A PATCH that changes the list on an already-VERIFIED domain re-runs `checkDomain`
+    immediately**, rather than waiting up to five minutes for the poller — which only ever
+    re-checks PENDING/TEMPORARY_FAILURE domains and would therefore never apply the edit at
+    all. It is the same code path, not a second one.
+  - The row is written **first** and never rolled back: a provider failure costs the sync,
+    never the operator's saved list. When the sync throws, the response carries an extra
+    `senderSyncError` string alongside the domain object.
+- `GET /v1/admin/domains` and `PATCH` return the full domain object (§3, `sender_usernames`
+  included) plus `projectSlug`, `fallbackCarrierId`, `notes`.
 - `GET /v1/admin/carriers` returns `isDefault`. `PATCH /v1/admin/carriers/:id` accepts
   `isDefault: true` (transactionally clears the flag on every other carrier; `false` just
   clears it). `POST /v1/admin/carriers` accepts `isDefault` too.
@@ -343,7 +413,11 @@ test message, confirm the Event Grid `Delivered` event flows through.
   Required, Status chip; "Verify DNS records" button (Server Action → admin verify) and
   "Delete domain" (confirm) — 409 shows "domain has messages; cannot delete". A one-line hint
   per record type for Cloudflare users: DKIM CNAMEs must be **DNS only** (grey cloud), not
-  proxied.
+  proxied. A "Sender addresses" card lists what is registered today, and the "Edit" section
+  carries a textarea for it — one address per line, `support@example.com` or
+  `Support <support@example.com>`, empty meaning "use the carrier's list". The textarea is
+  only sent when the form rendered it, so an absent field reads as "unchanged" rather than
+  "cleared".
 - **Settings → Carriers**: show "default" badge; action "Make default"; for SES carriers a
   small quota panel from `/quota` (production access yes/no, 24h quota, sent).
 - Keep existing conventions: Server Actions in `actions.ts`, `api()` helper, `StatusChip`
@@ -363,7 +437,7 @@ domains: {
 }
 ```
 
-Export `Domain`, `DnsRecord`, `DomainStatus` types (camelCase in TS, converted from the
+Export `Domain`, `DnsRecord`, `DomainStatus`, `SenderUsername` types (camelCase in TS, converted from the
 snake_case wire shape the same way emails are). Tests mock `fetch` like the existing ones.
 
 ## 11. Tests (vitest, beside modules in `__tests__/`) — minimum set
@@ -384,6 +458,11 @@ Added under D-15: `carriers/__tests__/acs.domains.test.ts` covering `qualify()`,
 read-modify-write (link and unlink each preserve unrelated entries), and the
 TEMPORARY_FAILURE mapping for 429/5xx ARM responses — with `fetch`, `sleep` and `now` all
 injected per `AcsDomainProvisionerDeps`, no live ARM call.
+
+Sender usernames (§2a) get their own describe block in the same file: the per-domain list
+overrides the carrier's, the carrier's is the fallback, the built-in defaults are the last
+resort, a full address normalises to its local part, a removed address is actually
+`DELETE`d, nothing configured deletes nothing, and a failed delete still reports VERIFIED.
 
 ## 12. Docs to update
 

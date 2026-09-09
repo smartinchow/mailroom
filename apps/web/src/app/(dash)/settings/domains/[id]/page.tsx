@@ -4,7 +4,7 @@ import { ApiError, api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import { CopyButton } from "@/components/CopyButton";
 import { DnsRecordStatusChip, DomainStatusChip } from "@/components/StatusChip";
-import type { Carrier, Domain, Project } from "@/lib/types";
+import type { Carrier, Domain, Project, SenderUsername } from "@/lib/types";
 import { deleteDomain, updateDomain, verifyDomain } from "../actions";
 import { domainErrorMessage } from "../errorMessages";
 import { DeleteDomainForm } from "../DeleteDomainForm";
@@ -58,6 +58,11 @@ function CarrierSelect({
   );
 }
 
+/** `Support <support@tintinpos.com>`, or the bare address when there is no display name. */
+function formatSender(s: SenderUsername): string {
+  return s.displayName ? `${s.displayName} <${s.username}>` : s.username;
+}
+
 async function fetchDomain(id: string): Promise<Domain | null> {
   try {
     return await api<Domain>(`/domains/${encodeURIComponent(id)}`);
@@ -88,6 +93,7 @@ export default async function DomainDetailPage({
   if (!domain) notFound();
 
   const errorMessage = domainErrorMessage(error);
+  const senders = domain.sender_usernames ?? [];
 
   return (
     <div className="space-y-6">
@@ -183,12 +189,49 @@ export default async function DomainDetailPage({
               <input name="notes" defaultValue={domain.notes ?? ""} className="input w-full" />
             </div>
             <div className="sm:col-span-2">
+              <label className="label">Sender addresses</label>
+              <textarea
+                name="senderUsernames"
+                rows={4}
+                defaultValue={senders.map(formatSender).join("\n")}
+                placeholder={`support@${domain.name}\nSupport <support@${domain.name}>`}
+                className="input w-full font-mono text-xs"
+              />
+              <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                One per line. Leave empty to use the carrier&apos;s own list.
+              </p>
+            </div>
+            <div className="sm:col-span-2">
               <button type="submit" className="btn-primary">
                 Save changes
               </button>
             </div>
           </form>
         </details>
+      </section>
+
+      <section className="card">
+        <h2 className="mb-1 text-base font-semibold">Sender addresses</h2>
+        <p className="mb-3 text-xs text-zinc-500 dark:text-zinc-400">
+          Registered with the carrier when the domain verifies. Azure Communication
+          Services rejects a send from an address it was never told about, and only says
+          so at send time — so an address missing here fails silently until someone
+          sends. Removing one stops it sending. Edit the list under &quot;Edit&quot;
+          above.
+        </p>
+        {senders.length === 0 ? (
+          <p className="text-sm text-zinc-500 dark:text-zinc-400">
+            None set for this domain — the carrier&apos;s configured senders are used.
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {senders.map((s) => (
+              <li key={s.username} className="font-mono text-sm">
+                {formatSender(s)}
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
       <section className="card overflow-x-auto p-0">

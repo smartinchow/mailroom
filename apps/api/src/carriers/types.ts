@@ -75,6 +75,16 @@ export interface DnsRecord {
 }
 
 /**
+ * One address a domain is allowed to send as. `username` is whatever the
+ * operator typed — a bare local part, a full address, or a display-name form —
+ * because normalising it is the provider's business, not the service's.
+ */
+export interface SenderIdentity {
+  username: string;
+  displayName?: string;
+}
+
+/**
  * Optional carrier capability: registering and verifying a sending identity
  * with the provider. SES and ACS (when given ARM credentials) implement it;
  * SMTP does not — domains on it are "manual" and go straight to VERIFIED.
@@ -100,10 +110,17 @@ export interface DomainProvisioner {
    * all records pass, to register sender usernames and add the domain to the
    * Communication Service's `linkedDomains` — without which it cannot send.
    * Every such side effect must be safe to repeat on every sweep.
+   *
+   * `opts.senders` is the domain's own sender list, set by the operator in
+   * Mailroom. A provisioner registers exactly these with the provider once the
+   * domain verifies, and — because the list is also how an address is taken
+   * away — removes any sender it holds that is not in the list. Empty or
+   * absent means "not configured": fall back to whatever the carrier itself
+   * configures, and remove nothing.
    */
   checkDomain(
     name: string,
-    opts: { mailFromDomain: string },
+    opts: { mailFromDomain: string; senders?: SenderIdentity[] },
   ): Promise<{ status: DomainStatus; records: DnsRecord[]; error?: string }>;
   /** Remove the identity. Must not throw if it is already gone. */
   deleteDomain(name: string): Promise<void>;
@@ -151,11 +168,14 @@ export interface AcsArmConfig {
   /** Communication Service resource the verified domain is linked to. */
   communicationServiceName: string;
   /**
-   * Local parts registered as senders on every domain this carrier provisions.
+   * Local parts registered as senders on every domain this carrier provisions
+   * that has no list of its own — the platform-wide fallback behind
+   * `Domain.senderUsernames`, which is where a real project's addresses
+   * belong (`support@tintinpos.com` is not `maro.com.au`'s business).
+   *
    * ACS rejects a send from an unregistered username, and the failure only
-   * shows up at send time, so a project sending as `support@` must have it
-   * listed. Omit to get the `noreply`/`donotreply` defaults. Entries may be a
-   * bare string or `{ username, displayName }`.
+   * shows up at send time. Omit to get the `noreply`/`donotreply` defaults.
+   * Entries may be a bare string or `{ username, displayName }`.
    */
   senderUsernames?: (string | { username: string; displayName?: string })[];
 }

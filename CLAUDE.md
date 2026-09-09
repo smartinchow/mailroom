@@ -27,6 +27,10 @@ toward delivering mail directly is out of scope (D-03).
 - **On AWS, SES sends and SNS only reports.** SNS is not a sending provider (D-09).
 - **The ACS `messageId`** that appears in Event Grid is the `beginSend` operation id — store
   it as `providerMessageId` at send time or events can never be matched.
+- **ACS sender usernames are per domain**, on `Domain.senderUsernames` — ACS rejects a send
+  from an unregistered local part at send time, with nothing wrong at provisioning time.
+  The carrier's `senderUsernames` is only the fallback. A PUT adds; removal needs a LIST +
+  DELETE of the ARM child resources, and "nothing configured" must never delete anything.
 - **ACS quota** on a new resource is low (~100/hour) and is raised by support ticket. It
   lives in carrier config (`ratePerHour`), never hardcoded.
 - **ACS SMTP relay**: `smtp.azurecomm.net:587`, username

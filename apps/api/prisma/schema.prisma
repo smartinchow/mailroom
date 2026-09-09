@@ -114,6 +114,7 @@ model Domain {
   notes             String?
   status            DomainStatus @default(PENDING)
   dnsRecords        Json         @default("[]")
+  senderUsernames   Json         @default("[]")
   mailFromDomain    String?
   lastCheckedAt     DateTime?
   verificationError String?
